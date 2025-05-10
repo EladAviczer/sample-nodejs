@@ -1,0 +1,41 @@
+# Node modules
+node_modules
+npm-debug.log
+yarn-error.log
+
+# Logs
+logs
+*.log
+
+# Environment files
+.env
+.env.local
+.env.development
+.env.production
+.env.test
+
+# Build files
+dist
+build
+coverage
+
+# Docker files
+Dockerfile
+Dockerfile.*
+.dockerignore
+
+# Git files
+.git
+.gitignore
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Misc
+README.md
+LICENSE
+*.md
+*.tsbuildinfo
