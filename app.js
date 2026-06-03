@@ -16,8 +16,6 @@ const helloWorldCounter = new promClient.Counter({
 });
 register.registerMetric(helloWorldCounter);
 
-
-
 // Define routes
 app.get('/my-app', (req, res) => {
     helloWorldCounter.inc();
@@ -25,7 +23,7 @@ app.get('/my-app', (req, res) => {
 });
 
 app.get('/about', (req, res) => {
-    res.send('This is a sample Node.js application for Kubernetes deployment testing.');
+    res.send('This is a sample Node.js application for Kubernetes deployment testing. [e2e: GitOps loop verified]');
 });
 
 app.get('/ready', (req, res) => {
@@ -45,6 +43,10 @@ app.get('/metrics', async (req, res) => {
     res.end(await register.metrics());
 });
 
-app.listen(port, () => {
-    console.log(`Server running on port ${port}`);
-});
+if (require.main === module) {
+    app.listen(port, () => {
+        console.log(`Server running on port ${port}`);
+    });
+}
+
+module.exports = app;

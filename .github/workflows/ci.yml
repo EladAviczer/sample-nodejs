@@ -1,0 +1,127 @@
+# CI/CD pipeline for sample-nodejs.
+#
+# Image tag scheme: <package.json#version>-<GITHUB_RUN_NUMBER>
+#   - Bump `version` in package.json manually for minor/major releases.
+#   - The CI run number is a monotonically increasing build counter.
+#   - Each `main` build creates a Docker Hub tag and a matching git tag `v<tag>`.
+#
+# Action-pinning policy:
+#   - Default: pin to major tag (e.g. @v4) for low maintenance.
+#   - Security-sensitive credential handler (`docker/login-action`) is SHA-pinned.
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Cancel superseded PR builds; never cancel `main` releases mid-flight (a half-pushed image
+# would leak an unscanned digest and confuse the GitOps promote step).
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+
+  sast:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    container:
+      image: semgrep/semgrep:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Semgrep (fail on errors/critical)
+        run: semgrep scan --config=auto --error --severity=ERROR
+
+  release:
+    needs: [test, sast]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    outputs:
+      image_tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: docker/setup-buildx-action@v3
+      - name: Compute version
+        id: version
+        run: |
+          BASE=$(node -p "require('./package.json').version")
+          TAG="${BASE}-${GITHUB_RUN_NUMBER}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Image tag: ${TAG}"
+      - name: Build image (load locally for scan)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: idoshoshani123/sample-nodejs:${{ steps.version.outputs.tag }}
+      - name: Trivy scan (block HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: idoshoshani123/sample-nodejs:${{ steps.version.outputs.tag }}
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          ignore-unfixed: true
+      - name: Log in to Docker Hub
+        # SHA-pinned: handles credentials, highest-trust action in the pipeline.
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3 latest
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Push image (only after scan passes)
+        run: docker push idoshoshani123/sample-nodejs:${{ steps.version.outputs.tag }}
+      - name: Create git tag for the release
+        run: |
+          git tag "v${{ steps.version.outputs.tag }}"
+          git push origin "v${{ steps.version.outputs.tag }}"
+
+  promote:
+    needs: release
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout GitOps repo
+        uses: actions/checkout@v4
+        with:
+          repository: IdoShoshani/devops-challenge-gitops
+          token: ${{ secrets.GITOPS_PAT }}
+          path: gitops
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+      - name: Bump image tag
+        # NOTE: `yq -i` reflows the YAML (strips blank lines and reformats). Keep long-form
+        # documentation in the file header where yq leaves it alone.
+        env:
+          TAG: ${{ needs.release.outputs.image_tag }}
+        run: |
+          cd gitops
+          yq -i '.image.tag = strenv(TAG)' apps/sample-nodejs/values.yaml
+          git config user.name "ci-bot"
+          git config user.email "ci-bot@users.noreply.github.com"
+          git commit -am "deploy: bump sample-nodejs image to ${TAG}"
+          git push
