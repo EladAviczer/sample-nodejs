@@ -1,0 +1,225 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+  security-events: write
+
+jobs:
+  sast:
+    name: SAST and lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web-app/package-lock.json
+
+      - name: Install dependencies
+        working-directory: web-app
+        run: npm ci
+
+      - name: npm audit (fail on critical)
+        working-directory: web-app
+        run: npm audit --audit-level=critical
+
+      - name: Semgrep SAST
+        run: |
+          python3 -m pip install --user semgrep
+          export PATH="$HOME/.local/bin:$PATH"
+          semgrep scan \
+            --config p/javascript \
+            --config p/nodejs \
+            --config p/owasp-top-ten \
+            --severity ERROR \
+            --error \
+            --metrics off
+
+      - name: Hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: error
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+
+      - name: Helm lint
+        run: helm lint ./helm/sample-nodejs -f ./helm/sample-nodejs/values.yaml -f ./helm/sample-nodejs/values-gitops.yaml
+
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+
+  version:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - name: Checkout app
+        uses: actions/checkout@v5
+
+      - name: Checkout GitOps repo
+        uses: actions/checkout@v5
+        with:
+          repository: eliranbt-commits/gitops-sample-nodejs
+          path: gitops
+
+      - name: Compute image version
+        id: ver
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GIT_REF: ${{ github.ref }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          current="$(sed -n 's/^appVersion: "\(.*\)"/\1/p' gitops/helm/sample-nodejs/Chart.yaml)"
+          if [ "$EVENT_NAME" = "push" ] && [ "$GIT_REF" = "refs/heads/main" ]; then
+            bump=patch
+            printf '%s\n' "$COMMIT_MSG" | grep -q 'bump:major' && bump=major
+            printf '%s\n' "$COMMIT_MSG" | grep -q 'bump:minor' && bump=minor
+            version="$(bash scripts/next-version.sh "$current" "$bump")"
+          else
+            version="pr-${GITHUB_SHA::7}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $version (current appVersion: $current)"
+
+  build:
+    name: Build, scan, and push
+    needs: [sast, version]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set image name
+        id: image
+        env:
+          IMAGE_NAME: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'eliranb1978/eliran-apps-images' || 'sample-nodejs' }}
+        run: printf 'name=%s\n' "$IMAGE_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          load: true
+          push: false
+          provenance: false
+          sbom: false
+          tags: local-scan:${{ env.VERSION }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Trivy image scan (fail on HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: local-scan:${{ env.VERSION }}
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+          format: table
+
+      - name: Login to Docker Hub
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Push image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          provenance: false
+          sbom: false
+          tags: |
+            eliranb1978/eliran-apps-images:${{ env.VERSION }}
+            eliranb1978/eliran-apps-images:sha-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  gitops:
+    name: Pin image tag for ArgoCD
+    needs: [build, version]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - name: Checkout app
+        uses: actions/checkout@v5
+        with:
+          path: app
+          persist-credentials: true
+
+      - name: Checkout GitOps repo
+        uses: actions/checkout@v5
+        with:
+          repository: eliranbt-commits/gitops-sample-nodejs
+          token: ${{ secrets.GITOPS_TOKEN }}
+          path: gitops
+          persist-credentials: true
+
+      - name: Pin Helm chart and image tag in GitOps repo
+        working-directory: gitops
+        run: |
+          set -euxo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          mkdir -p helm/sample-nodejs
+          cp -a ../app/helm/sample-nodejs/. helm/sample-nodejs/
+          chmod +x ../app/scripts/*.sh
+          bash ../app/scripts/apply-version.sh "${VERSION}" "docker.io/eliranb1978/eliran-apps-images" "$GITHUB_WORKSPACE/gitops"
+          git add helm/sample-nodejs
+          git diff --cached
+          git commit -m "chore(release): ${VERSION}"
+          git tag "v${VERSION}" || git tag -f "v${VERSION}"
+          git push origin HEAD:main
+          git push origin "v${VERSION}" --force
+
+      - name: Mirror image tag in the app repo (visibility, not Argo)
+        working-directory: app
+        run: |
+          set -euxo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          chmod +x scripts/*.sh
+          bash scripts/apply-version.sh "${VERSION}" "docker.io/eliranb1978/eliran-apps-images" "$GITHUB_WORKSPACE/app"
+          git add helm/sample-nodejs/Chart.yaml helm/sample-nodejs/values-gitops.yaml web-app/package.json
+          git diff --cached
+          git commit -m "chore(release): ${VERSION} [skip ci]"
+          git tag "v${VERSION}" || git tag -f "v${VERSION}"
+          git push origin HEAD:main
+          git push origin "v${VERSION}" --force
