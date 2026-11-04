@@ -1,0 +1,8 @@
+apiVersion: v2
+name: sample-app
+description: Helm chart for the sample Node.js Express app
+type: application
+# Chart version. Bump on any change to the chart.
+version: 0.1.0
+# Default image tag when image.tag is not set. The GitOps repo sets image.tag per deploy.
+appVersion: "1.0.0"
