@@ -1,0 +1,88 @@
+# Default values for sample-app. The GitOps repo overrides these per environment.
+
+# Two replicas so a node drain or pod restart is not an outage.
+# Ignored when autoscaling.enabled is true (the HPA owns the replica count).
+replicaCount: 2
+
+image:
+  # Set per environment in the GitOps repo (ECR repository URI).
+  repository: sample-app
+  # Set by CI in the GitOps repo on each deploy. Empty falls back to Chart.appVersion.
+  tag: ""
+
+serviceAccount:
+  # The app does not call the Kubernetes API, so no token is mounted.
+  automount: false
+  # For example an IRSA role: eks.amazonaws.com/role-arn
+  annotations: {}
+
+podAnnotations: {}
+podLabels: {}
+
+# Pod-level security settings.
+podSecurityContext:
+  # The image runs as USER node. runAsNonRoot needs a numeric UID to verify it.
+  runAsUser: 1000
+  runAsGroup: 1000
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+# Container-level security settings.
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+service:
+  # The app listens on 8080 (PORT default in app.js). Used for both containerPort and the Service port.
+  port: 8080
+
+ingress:
+  enabled: false
+  # IngressClass of the controller in the cluster, for example nginx or alb.
+  className: ""
+  annotations: {}
+  # Only the public endpoints. /classified and /metrics are not exposed.
+  hosts:
+    - host: sample-app.local
+      paths:
+        - path: /my-app
+          pathType: Prefix
+        - path: /about
+          pathType: Prefix
+  tls: []
+
+# Starting estimates; tune from observed usage.
+# No CPU limit to avoid throttling; the memory limit stops a leak from hurting the node.
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 128Mi
+
+livenessProbe:
+  httpGet:
+    path: /live
+    port: http
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: http
+
+# Prometheus Operator scrape config for /metrics. Needs the ServiceMonitor CRD in the cluster.
+serviceMonitor:
+  enabled: false
+  # Labels the Prometheus instance selects on, for example release: kube-prometheus-stack
+  labels: {}
+  interval: 30s
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 5
+  # Percent of resources.requests.cpu, averaged over all pods.
+  targetCPUUtilizationPercentage: 70
