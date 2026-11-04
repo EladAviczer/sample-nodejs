@@ -11,6 +11,7 @@ Use GitHub Flow because:
 - CI runs on the PR before the merge, keeping broken code out of `main` and the cluster.
 - Each task fits one branch (`feat/`, `fix/`, `ci/`, `chore/`, `docs/`) and one PR.
 - `main` is protected: no direct pushes, CI required.
+- PRs are squash-merged: one commit per PR on `main`, and the PR title (a Conventional Commit) drives the version bump.
 
 ## Alternatives considered
 - Trunk-Based Development (commit to `main`, or to branches that live less than a day): rejected because avoiding merge conflicts across many developers doesn't matter for a single developer, and unfinished work would need feature flags.
