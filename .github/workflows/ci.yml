@@ -92,8 +92,43 @@ jobs:
   build:
     needs: [test, sast]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    env:
+      IMAGE: sample-app:${{ github.sha }}
+      TRIVY_IMAGE: aquasec/trivy:0.76.2@sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Build image
-        run: docker build -t sample-app:${{ github.sha }} .
+        run: docker build -t "$IMAGE" .
+
+      # Docker socket lets Trivy read the local image; the cache mount reuses the vulnerability DB between the two scans
+      - name: Trivy scan (fail on HIGH/CRITICAL)
+        run: >-
+          docker run --rm
+          -v /var/run/docker.sock:/var/run/docker.sock
+          -v "$HOME/.cache/trivy:/root/.cache/trivy"
+          "$TRIVY_IMAGE" image
+          --severity HIGH,CRITICAL --exit-code 1
+          "$IMAGE"
+
+      # Runs even when the scan fails, so findings still reach the Security tab
+      - name: Trivy SARIF report
+        if: success() || failure()
+        run: >-
+          docker run --rm
+          -v /var/run/docker.sock:/var/run/docker.sock
+          -v "$HOME/.cache/trivy:/root/.cache/trivy"
+          -v "$PWD:/out"
+          "$TRIVY_IMAGE" image
+          --severity HIGH,CRITICAL --format sarif --output /out/trivy.sarif
+          "$IMAGE"
+
+      - name: Upload results to Security tab
+        if: success() || failure()
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: trivy.sarif
+          category: trivy
