@@ -104,6 +104,9 @@ jobs:
       - name: Build image
         run: docker build -t "$IMAGE" .
 
+      - name: Integration test
+        run: scripts/integration-test.sh "$IMAGE"
+
       # Docker socket lets Trivy read the local image; the cache mount reuses the vulnerability DB between the two scans
       - name: Trivy scan (fail on HIGH/CRITICAL)
         run: >-
