@@ -7,20 +7,39 @@ on:
   pull_request:
     branches: [main]
 
+# Cancel in-flight runs for the same ref on new pushes (PRs only — never cancel a release)
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Default: read-only. Jobs that need more declare it themselves.
+permissions:
+  contents: read
+
 env:
   AWS_REGION: us-east-1
   ECR_REPOSITORY: sample-nodejs
 
+# ─────────────────────────────────────────────────────────────────────────────
+# PR / main push: 3 fully parallel jobs (no `needs` between them)
+# ─────────────────────────────────────────────────────────────────────────────
+
 jobs:
-  # ── 1. SAST ────────────────────────────────────────────────────────────────
   sast:
     name: SAST
+    if: "!startsWith(github.ref, 'refs/tags/')"
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install dependencies
-        run: npm ci
+      - uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ hashFiles('package-lock.json') }}
+          restore-keys: npm-
+
+      - run: npm ci
 
       - name: npm audit — SCA (block on HIGH+)
         run: npm audit --audit-level=high
@@ -30,46 +49,29 @@ jobs:
         with:
           args: "."
 
-  # ── 2. Helm lint ───────────────────────────────────────────────────────────
   helm-lint:
     name: Helm Lint
+    if: "!startsWith(github.ref, 'refs/tags/')"
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+      - run: helm lint helm/ --strict
 
-      - name: Lint Helm chart
-        run: helm lint helm/
-
-  # ── 3. Build → Trivy scan → ECR push (push only on git tags) ──────────────
-  build-scan-push:
-    name: Build / Scan / Push
+  build-and-scan:
+    name: Build & Trivy Scan
+    if: "!startsWith(github.ref, 'refs/tags/')"
     runs-on: ubuntu-latest
-    needs: [sast, helm-lint]
-    permissions:
-      id-token: write  # OIDC → AWS
-      contents: read
-    outputs:
-      image_tag: ${{ steps.tag.outputs.tag }}
-      ecr_registry: ${{ steps.login-ecr.outputs.registry }}
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
       - name: Derive image tag
         id: tag
-        run: |
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            TAG="${GITHUB_REF#refs/tags/}"
-          else
-            TAG="sha-${GITHUB_SHA::7}"
-          fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+        run: echo "tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
-      - name: Build Docker image (local daemon)
-        run: |
-          docker build \
-            --tag "${{ env.ECR_REPOSITORY }}:${{ steps.tag.outputs.tag }}" \
-            --file Dockerfile \
-            .
+      - name: Build Docker image (local)
+        run: docker build -t "${{ env.ECR_REPOSITORY }}:${{ steps.tag.outputs.tag }}" .
 
       - name: Trivy scan — gate on HIGH+ (ignore unfixed)
         uses: aquasecurity/trivy-action@0.28.0
@@ -88,9 +90,49 @@ jobs:
           name: trivy-sarif
           path: trivy.sarif
 
-      # Tag releases only ──────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Release (git tag v*): minimal sequential chain — sast/lint already ran on PR
+# ─────────────────────────────────────────────────────────────────────────────
+
+  build-scan-push:
+    name: Build / Scan / Push
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      id-token: write  # OIDC → AWS
+      contents: read
+    outputs:
+      image_tag: ${{ steps.tag.outputs.tag }}
+      ecr_registry: ${{ steps.login-ecr.outputs.registry }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Derive image tag
+        id: tag
+        run: echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+
+      - name: Build Docker image (local)
+        run: docker build -t "${{ env.ECR_REPOSITORY }}:${{ steps.tag.outputs.tag }}" .
+
+      - name: Trivy scan — gate on HIGH+ (ignore unfixed)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: "${{ env.ECR_REPOSITORY }}:${{ steps.tag.outputs.tag }}"
+          exit-code: "1"
+          severity: "HIGH,CRITICAL"
+          ignore-unfixed: "true"
+          format: "sarif"
+          output: "trivy.sarif"
+
+      - name: Upload Trivy report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-sarif
+          path: trivy.sarif
+
       - name: Configure AWS credentials (OIDC)
-        if: startsWith(github.ref, 'refs/tags/v')
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
@@ -98,11 +140,9 @@ jobs:
 
       - name: Login to ECR
         id: login-ecr
-        if: startsWith(github.ref, 'refs/tags/v')
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Tag and push image to ECR
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Tag and push to ECR
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ steps.tag.outputs.tag }}
@@ -110,14 +150,13 @@ jobs:
           docker tag "${{ env.ECR_REPOSITORY }}:$IMAGE_TAG" \
             "$ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG"
           docker push "$ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG"
-          echo "pushed: $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG"
 
-  # ── 4. Open deploy PR (updates helm/values.yaml image tag) ─────────────────
   update-image-tag:
     name: Open Deploy PR
-    runs-on: ubuntu-latest
     needs: build-scan-push
     if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: write
       pull-requests: write
