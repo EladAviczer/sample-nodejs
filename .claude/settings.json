@@ -4,5 +4,23 @@
     "AWS_PROFILE": "assignment-tests",
     "AWS_REGION": "us-east-1",
     "AWS_DEFAULT_REGION": "us-east-1"
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "node \"${CLAUDE_PROJECT_DIR}/.agents/dispatcher.mjs\" session_start team-boot .claude/skills 60",
+        "_adlc_skills_cli": true,
+        "timeout": 60
+      }
+    ],
+    "SessionEnd": [
+      {
+        "type": "command",
+        "command": "node \"${CLAUDE_PROJECT_DIR}/.agents/dispatcher.mjs\" session_end team-levelup .claude/skills 120",
+        "_adlc_skills_cli": true,
+        "timeout": 120
+      }
+    ]
   }
 }

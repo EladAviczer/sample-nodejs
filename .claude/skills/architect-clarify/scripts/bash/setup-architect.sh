@@ -1,0 +1,1944 @@
+#!/usr/bin/env bash
+
+set -e
+
+# JSON output always goes through jq -n (no manual string building).
+
+JSON_MODE=false
+ACTION=""
+ARGS=()
+VIEWS="core"
+ADR_HEURISTIC="surprising"
+DECOMPOSE=true
+PREVIEW=false
+
+# Get script directory FIRST (needed for common.sh sourcing)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Find project root by walking up from CWD
+_find_project_root() {
+    local dir="$(pwd)"
+    while [ "$dir" != "/" ]; do
+        if [ -d "$dir/.adlc" ] || [ -d "$dir/.git" ]; then
+            echo "$dir"
+            return 0
+        fi
+        dir="$(dirname "$dir")"
+    done
+    return 1
+}
+
+PROJECT_ROOT="$(_find_project_root)" || PROJECT_ROOT="$(pwd)"
+
+# Load common functions - use absolute path from project root
+if [[ -n "$PROJECT_ROOT" && -f "$PROJECT_ROOT/.adlc/scripts/bash/common.sh" ]]; then
+    source "$PROJECT_ROOT/.adlc/scripts/bash/common.sh"
+elif [[ -f "$SCRIPT_DIR/common.sh" ]]; then
+    source "$SCRIPT_DIR/common.sh"
+else
+    echo "Error: Could not find common.sh" >&2
+    exit 1
+fi
+
+# Get all paths and variables from common functions (parse, never eval:
+# eval would execute path content as shell code if it contained $(...) or quotes)
+REPO_ROOT=$(get_feature_paths | sed -n 's/^REPO_ROOT="\(.*\)"$/\1/p')
+if [[ -z "${REPO_ROOT:-}" ]]; then
+  echo "Error: could not resolve repository root" >&2
+  exit 1
+fi
+
+# Layout roots (.adlc/ machine pipeline; docs/adlc/ human-facing deliverables)
+ADLC_DIR="${ADLC_DIR:-.adlc}"
+DOCS_ADLC_DIR="${DOCS_ADLC_DIR:-docs/adlc}"
+DOCS_ADLC_MEMORY="${DOCS_ADLC_MEMORY:-docs/adlc/memory}"
+DOCS_ADLC_PRODUCT="${DOCS_ADLC_PRODUCT:-docs/adlc/product}"
+DOCS_ADLC_ARCHITECT="${DOCS_ADLC_ARCHITECT:-docs/adlc/architect}"
+ADLC_DRAFTS="${ADLC_DRAFTS:-.adlc/drafts}"
+
+# dual-read: resolve a memory-relative artifact to the canonical
+# docs/adlc/memory path, falling back to legacy .adlc/memory when only the
+# legacy file exists. Writers use the canonical path directly.
+_adlc_memory_path() {
+    local rel="$1"
+    local docs_path="$REPO_ROOT/${DOCS_ADLC_MEMORY:-docs/adlc/memory}/$rel"
+    local legacy_path="$REPO_ROOT/.adlc/memory/$rel"
+    if [[ -e "$docs_path" ]]; then
+        echo "$docs_path"
+    else
+        echo "$legacy_path"
+    fi
+}
+
+# Sourcing contract: `source setup-architect.sh` must define helpers and
+# constants ONLY -- the SKILL.md flows source this file and then call
+# next_adr_number / next_ad_delta_version / generate_adr_index. The argument
+# parse, the default action and the dispatch run only when the file is
+# executed (before this guard, a bare source ran the whole default action).
+SETUP_ARCHITECT_EXECUTED=1
+if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
+    SETUP_ARCHITECT_EXECUTED=0
+fi
+
+if [[ "$SETUP_ARCHITECT_EXECUTED" == 1 ]]; then
+# Parse arguments (run after common.sh to have REPO_ROOT defined)
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --json)
+            JSON_MODE=true
+            shift
+            ;;
+        --views)
+            shift
+            VIEWS="$1"
+            shift
+            ;;
+        --views=*)
+            VIEWS="${1#*=}"
+            shift
+            ;;
+        --adr-heuristic)
+            shift
+            ADR_HEURISTIC="$1"
+            shift
+            ;;
+        --adr-heuristic=*)
+            ADR_HEURISTIC="${1#*=}"
+            shift
+            ;;
+        --no-decompose)
+            DECOMPOSE=false
+            shift
+            ;;
+        --no-decompose=*)
+            DECOMPOSE=false
+            shift
+            ;;
+        --preview)
+            PREVIEW=true
+            shift
+            ;;
+        init|map|update|review|specify|implement|clarify|analyze|validate|plan-dag|execute-dag|summarize)
+            ACTION="$1"
+            shift
+            ;;
+        --help|-h)
+            echo "Usage: $0 [action] [context] [--json] [--views VIEWS] [--adr-heuristic HEURISTIC]"
+            echo ""
+            echo "Actions:"
+            echo "  specify    Interactive PRD exploration to create system ADRs (greenfield)"
+            echo "  clarify    Refine and resolve ambiguities in existing ADRs"
+            echo "  init       Reverse-engineer architecture from existing codebase (brownfield)"
+            echo "  implement  Generate full Architecture Description (AD.md) from ADRs"
+            echo "  analyze    Validate architecture for consistency and quality issues"
+            echo "  validate   Validate plan alignment with architecture (READ-ONLY)"
+            echo "  map        (alias for init) Reverse-engineer architecture from existing codebase"
+            echo "  update     Update architecture based on code/spec changes"
+            echo "  review     Validate architecture against constitution"
+            echo ""
+            echo "DAG Workflow Actions (used internally by implement):"
+            echo "  plan-dag   Phase 1: Generate DAG execution plan for user approval"
+            echo "  execute-dag Phase 2: Execute DAG to generate views per sub-system"
+            echo "  summarize  Phase 3: Aggregate views into unified AD.md"
+            echo ""
+            echo "Options:"
+            echo "  --json             Output results in JSON format"
+            echo "  --views VIEWS      Architecture views to generate: core (default), all, or comma-separated"
+            echo "  --adr-heuristic H  ADR generation heuristic: surprising (default), all, minimal"
+            echo "  --no-decompose     Disable automatic sub-system decomposition (default: auto-detect)"
+            echo "  --preview          Preview only: list planned writes (AD.md, views, promotions) without writing"
+            echo "  --help             Show this help message"
+            echo ""
+            echo "Examples:"
+            echo "  $0 specify \"B2B SaaS for supply chain management\""
+            echo "  $0 init --views all \"Django monolith with PostgreSQL\""
+            echo "  $0 init --views concurrency,operational \"Microservices architecture\""
+            echo "  $0 clarify --adr-heuristic all \"Document all decisions\""
+            echo "  $0 implement \"Generate full AD.md from ADRs\""
+            echo ""
+            echo "Pro Tip: Add context/description after the action for better results."
+            echo "The AI will use your input to understand system scope and constraints."
+            exit 0
+            ;;
+        *)
+            ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# Default action if not specified
+if [[ -z "$ACTION" ]]; then
+    if [[ -f "$REPO_ROOT/${DOCS_ADLC_ARCHITECT:-docs/adlc/architect}/AD.md" || -f "$REPO_ROOT/AD.md" ]]; then
+        ACTION="update"
+    else
+        ACTION="init"
+    fi
+fi
+
+# Ensure directories exist ( compiled AD lives under docs/adlc/architect)
+mkdir -p "$REPO_ROOT/.adlc/memory"
+mkdir -p "$REPO_ROOT/${ADLC_DRAFTS:-.adlc/drafts}"
+mkdir -p "$REPO_ROOT/${DOCS_ADLC_ARCHITECT:-docs/adlc/architect}"
+fi  # end SETUP_ARCHITECT_EXECUTED (parse + defaults + directory seeding)
+
+# Architecture files (ADR Lifecycle)
+AD_FILE="$REPO_ROOT/docs/adlc/architect/AD.md"
+TEMPLATE_FILE="$REPO_ROOT/.adlc/templates/architecture-template.md"
+AD_TEMPLATE_FILE="$REPO_ROOT/.adlc/templates/AD-template.md"
+
+# Export for use in functions
+export ARCHITECTURE_VIEWS="$VIEWS"
+export ADR_HEURISTIC="$ADR_HEURISTIC"
+export DECOMPOSE="$DECOMPOSE"
+
+# Function to detect sub-systems from codebase structure
+detect_subsystems() {
+    local subsystems=""
+    local count=0
+    
+    echo "Detecting sub-systems from codebase structure..." >&2
+    
+    # Check for common sub-system patterns
+    
+    # 1. Top-level feature directories (src/, app/, services/)
+    local dirs=()
+    if [[ -d "src" ]]; then
+        for d in src/*/; do
+            if [[ -d "$d" ]]; then
+                local dirname
+                dirname=$(basename "$d")
+                # Skip common non-sub-system directories
+                if [[ "$dirname" != "utils" && "$dirname" != "common" && "$dirname" != "lib" && "$dirname" != "shared" && "$dirname" != "core" ]]; then
+                    dirs+=("$dirname")
+                fi
+            fi
+        done
+    fi
+    
+    if [[ -d "services" ]]; then
+        for d in services/*/; do
+            if [[ -d "$d" ]]; then
+                local dirname
+                dirname=$(basename "$d")
+                dirs+=("$dirname")
+            fi
+        done
+    fi
+    
+    if [[ -d "modules" ]]; then
+        for d in modules/*/; do
+            if [[ -d "$d" ]]; then
+                local dirname
+                dirname=$(basename "$d")
+                dirs+=("$dirname")
+            fi
+        done
+    fi
+    
+    if [[ -d "apps" ]]; then
+        for d in apps/*/; do
+            if [[ -d "$d" ]]; then
+                local dirname
+                dirname=$(basename "$d")
+                dirs+=("$dirname")
+            fi
+        done
+    fi
+    
+    # 2. Check for docker-compose services (microservices indicator)
+    if [[ -f "docker-compose.yml" ]] || [[ -f "docker-compose.yaml" ]]; then
+        local compose_file="docker-compose.yml"
+        [[ -f "docker-compose.yaml" ]] && compose_file="docker-compose.yaml"
+        
+        local services=()
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^[[:space:]]*([a-zA-Z0-9_-]+):[[:space:]]*$ ]]; then
+                local svc="${BASH_REMATCH[1]}"
+                # Skip common non-service entries
+                if [[ "$svc" != "version" && "$svc" != "services" && "$svc" != "networks" && "$svc" != "volumes" ]]; then
+                    services+=("$svc")
+                fi
+            fi
+        done < "$compose_file"
+        
+        for svc in "${services[@]}"; do
+            local found=false
+            for d in "${dirs[@]}"; do
+                d_lower=$(printf '%s' "$d" | tr '[:upper:]' '[:lower:]')
+                svc_lower=$(printf '%s' "$svc" | tr '[:upper:]' '[:lower:]')
+                if [[ "$d_lower" == *"$svc_lower"* ]] || [[ "$svc_lower" == *"$d_lower"* ]]; then
+                    found=true
+                    break
+                fi
+            done
+            if [[ "$found" == "false" ]]; then
+                dirs+=("$svc")
+            fi
+        done
+    fi
+    
+    # 3. Check for Node.js workspaces (monorepo indicator)
+    if [[ -f "package.json" ]]; then
+        if grep -q '"workspaces"' package.json 2>/dev/null; then
+            local pkgs
+            pkgs=$(node -e "try { const p = require('./package.json'); console.log(Object.keys(p.workspaces?.packages || {}).join(' ')); } catch(e) { }" 2>/dev/null || true)
+            for pkg in $pkgs; do
+                local dirname
+                dirname=$(basename "$pkg")
+                if [[ "$dirname" != "node_modules" ]]; then
+                    dirs+=("$dirname")
+                fi
+            done
+        fi
+    fi
+    
+    # 4. Check for Python namespace packages
+    if [[ -f "pyproject.toml" ]]; then
+        local pkg_dirs=()
+        while IFS= read -r -d '' d; do
+            pkg_dirs+=("$(basename "$d")")
+        done < <(find . -maxdepth 3 -name "__init__.py" -printf '%h\n' 2>/dev/null | grep -v node_modules | grep -v __pycache__ | sort -u || true)
+        
+        for pdir in "${pkg_dirs[@]}"; do
+            if [[ "$pdir" != "." && "$pdir" != "src" ]]; then
+                dirs+=("$pdir")
+            fi
+        done
+    fi
+    
+    # Remove duplicates and build output
+    local unique_dirs=($(printf '%s\n' "${dirs[@]}" | sort -u))
+    
+    if [[ ${#unique_dirs[@]} -gt 0 ]]; then
+        echo "Detected potential sub-systems:" >&2
+        for d in "${unique_dirs[@]}"; do
+            ((count++))
+            echo "  - $d" >&2
+        done
+        echo "Total: $count sub-system(s)" >&2
+    else
+        echo "No distinct sub-systems detected from directory structure." >&2
+    fi
+    
+    # Return as JSON if JSON mode
+    if $JSON_MODE; then
+        echo "["
+        local first=true
+        for d in "${unique_dirs[@]}"; do
+            if [[ "$first" == "true" ]]; then
+                first=false
+            else
+                echo ","
+            fi
+            jq -n --arg d "$d" '{"id":$d,"name":$d,"detection_method":"directory","evidence":("directory: "+$d+"/")}'
+        done
+        echo ""
+        echo "]"
+    fi
+}
+
+# Function to detect tech stack from codebase
+detect_tech_stack() {
+    local tech_stack=""
+    
+    echo "Scanning codebase for technology stack..." >&2
+    
+    # Languages
+    if [[ -f "package.json" ]]; then
+        tech_stack+="**Languages**: JavaScript/TypeScript\n"
+        tech_stack+="**Package Manager**: npm/yarn\n"
+    fi
+    
+    if [[ -f "requirements.txt" ]] || [[ -f "setup.py" ]] || [[ -f "pyproject.toml" ]]; then
+        tech_stack+="**Languages**: Python\n"
+        if [[ -f "pyproject.toml" ]]; then
+            tech_stack+="**Package Manager**: pip/poetry/uv\n"
+        fi
+    fi
+    
+    if [[ -f "Cargo.toml" ]]; then
+        tech_stack+="**Languages**: Rust\n"
+        tech_stack+="**Package Manager**: Cargo\n"
+    fi
+    
+    if [[ -f "go.mod" ]]; then
+        tech_stack+="**Languages**: Go\n"
+        tech_stack+="**Package Manager**: go modules\n"
+    fi
+    
+    if [[ -f "pom.xml" ]] || [[ -f "build.gradle" ]]; then
+        tech_stack+="**Languages**: Java\n"
+        if [[ -f "pom.xml" ]]; then
+            tech_stack+="**Build System**: Maven\n"
+        else
+            tech_stack+="**Build System**: Gradle\n"
+        fi
+    fi
+    
+    if [[ -f "*.csproj" ]] || [[ -f "*.sln" ]]; then
+        tech_stack+="**Languages**: C#/.NET\n"
+        tech_stack+="**Build System**: dotnet\n"
+    fi
+    
+    # Frameworks (basic detection)
+    if [[ -f "package.json" ]]; then
+        if grep -q "react" package.json 2>/dev/null; then
+            tech_stack+="**Frontend Framework**: React\n"
+        fi
+        if grep -q "vue" package.json 2>/dev/null; then
+            tech_stack+="**Frontend Framework**: Vue\n"
+        fi
+        if grep -q "angular" package.json 2>/dev/null; then
+            tech_stack+="**Frontend Framework**: Angular\n"
+        fi
+        if grep -q "express" package.json 2>/dev/null; then
+            tech_stack+="**Backend Framework**: Express\n"
+        fi
+        if grep -q "fastify" package.json 2>/dev/null; then
+            tech_stack+="**Backend Framework**: Fastify\n"
+        fi
+    fi
+    
+    if [[ -f "requirements.txt" ]] || [[ -f "pyproject.toml" ]]; then
+        if grep -q "django" requirements.txt 2>/dev/null || grep -q "django" pyproject.toml 2>/dev/null; then
+            tech_stack+="**Backend Framework**: Django\n"
+        fi
+        if grep -q "fastapi" requirements.txt 2>/dev/null || grep -q "fastapi" pyproject.toml 2>/dev/null; then
+            tech_stack+="**Backend Framework**: FastAPI\n"
+        fi
+        if grep -q "flask" requirements.txt 2>/dev/null || grep -q "flask" pyproject.toml 2>/dev/null; then
+            tech_stack+="**Backend Framework**: Flask\n"
+        fi
+    fi
+    
+    # Databases
+    if [[ -f "docker-compose.yml" ]] || [[ -f "docker-compose.yaml" ]]; then
+        if grep -q "postgres" docker-compose.* 2>/dev/null; then
+            tech_stack+="**Database**: PostgreSQL\n"
+        fi
+        if grep -q "mysql" docker-compose.* 2>/dev/null; then
+            tech_stack+="**Database**: MySQL\n"
+        fi
+        if grep -q "mongodb" docker-compose.* 2>/dev/null; then
+            tech_stack+="**Database**: MongoDB\n"
+        fi
+        if grep -q "redis" docker-compose.* 2>/dev/null; then
+            tech_stack+="**Cache**: Redis\n"
+        fi
+    fi
+    
+    # Infrastructure
+    if [[ -f "Dockerfile" ]]; then
+        tech_stack+="**Containerization**: Docker\n"
+    fi
+    
+    local yaml_files=(*.yaml)
+    if [[ -d "kubernetes" ]] || [[ -d "k8s" ]] || [[ -f "${yaml_files[0]}" ]] && grep -q "apiVersion:" *.yaml 2>/dev/null; then
+        tech_stack+="**Orchestration**: Kubernetes\n"
+    fi
+    
+    if [[ -d "terraform" ]] || [[ -f "*.tf" ]]; then
+        tech_stack+="**IaC**: Terraform\n"
+    fi
+    
+    local github_yml_files=(".github/workflows/"*.yml)
+    local github_yaml_files=(".github/workflows/"*.yaml)
+    if [[ -f "${github_yml_files[0]}" ]] || [[ -f "${github_yaml_files[0]}" ]]; then
+        tech_stack+="**CI/CD**: GitHub Actions\n"
+    fi
+    
+    if [[ -f ".gitlab-ci.yml" ]]; then
+        tech_stack+="**CI/CD**: GitLab CI\n"
+    fi
+    
+    if [[ -f "Jenkinsfile" ]]; then
+        tech_stack+="**CI/CD**: Jenkins\n"
+    fi
+    
+    echo -e "$tech_stack"
+}
+
+# Function to map directory structure
+map_directory_structure() {
+    echo "Scanning directory structure..." >&2
+    
+    local structure=""
+    
+    # Common patterns
+    if [[ -d "src" ]]; then
+        structure+="**Source Code**: src/\n"
+        if [[ -d "src/api" ]] || [[ -d "src/routes" ]]; then
+            structure+="  - API Layer: src/api/ or src/routes/\n"
+        fi
+        if [[ -d "src/services" ]]; then
+            structure+="  - Business Logic: src/services/\n"
+        fi
+        if [[ -d "src/models" ]]; then
+            structure+="  - Data Models: src/models/\n"
+        fi
+        if [[ -d "src/utils" ]]; then
+            structure+="  - Utilities: src/utils/\n"
+        fi
+    fi
+    
+    if [[ -d "tests" ]] || [[ -d "test" ]]; then
+        structure+="**Tests**: tests/ or test/\n"
+    fi
+    
+    if [[ -d "docs" ]]; then
+        structure+="**Documentation**: docs/\n"
+    fi
+    
+    if [[ -d "scripts" ]]; then
+        structure+="**Scripts**: scripts/\n"
+    fi
+    
+    if [[ -d "infra" ]] || [[ -d "infrastructure" ]]; then
+        structure+="**Infrastructure**: infra/ or infrastructure/\n"
+    fi
+    
+    echo -e "$structure"
+}
+
+# Function to extract API endpoints (basic pattern matching)
+extract_api_endpoints() {
+    echo "Scanning for API endpoints..." >&2
+    
+    local endpoints=""
+    
+    # Look for common API route patterns
+    if [[ -d "src" ]]; then
+        # Express.js style
+        endpoints+=$(grep -r "router\.\(get\|post\|put\|delete\|patch\)" src 2>/dev/null | head -10 || true)
+        
+        # FastAPI style
+        endpoints+=$(grep -r "@app\.\(get\|post\|put\|delete\|patch\)" src 2>/dev/null | head -10 || true)
+        
+        # Flask style
+        endpoints+=$(grep -r "@app\.route" src 2>/dev/null | head -10 || true)
+    fi
+    
+    if [[ -n "$endpoints" ]]; then
+        echo "API Endpoints detected (sample):"
+        echo "$endpoints" | head -10
+    fi
+}
+
+# Function to scan existing docs for deduplication
+scan_existing_docs() {
+    local repo_root="${1:-$REPO_ROOT}"
+    local findings=""
+    
+    echo "Scanning existing documentation for deduplication..." >&2
+    
+    # Check for existing architecture docs
+    if [[ -f "$repo_root/AD.md" ]]; then
+        findings+="EXISTING_AD: $repo_root/AD.md\n"
+    fi
+    
+    if [[ -f "$repo_root/docs/architecture.md" ]]; then
+        findings+="EXISTING_ARCHITECTURE: $repo_root/docs/architecture.md\n"
+    fi
+    
+    # Scan README for tech stack
+    if [[ -f "$repo_root/README.md" ]]; then
+        if grep -q "Tech Stack\|Technology\|Built with" "$repo_root/README.md" 2>/dev/null; then
+            findings+="TECH_STACK_IN_README: $repo_root/README.md\n"
+        fi
+        if grep -q "PostgreSQL\|MySQL\|MongoDB\|Redis" "$repo_root/README.md" 2>/dev/null; then
+            findings+="DATABASE_IN_README: $repo_root/README.md\n"
+        fi
+        if grep -q "React\|Vue\|Angular" "$repo_root/README.md" 2>/dev/null; then
+            findings+="FRONTEND_IN_README: $repo_root/README.md\n"
+        fi
+    fi
+    
+    # Scan AGENTS.md for context
+    if [[ -f "$repo_root/AGENTS.md" ]]; then
+        findings+="AGENTS_CONTEXT: $repo_root/AGENTS.md\n"
+    fi
+    
+    # Scan CONTRIBUTING.md for dev guidelines
+    if [[ -f "$repo_root/CONTRIBUTING.md" ]]; then
+        findings+="DEV_GUIDELINES: $repo_root/CONTRIBUTING.md\n"
+    fi
+    
+    echo -e "$findings"
+}
+
+# Function to parse views flag
+parse_views() {
+    local views_arg="$1"
+    
+    case "$views_arg" in
+        "all"|"full")
+            echo "context functional information concurrency development deployment operational"
+            ;;
+        "core"|"minimal"|"")
+            echo "context functional information development deployment"
+            ;;
+        *)
+            # Parse comma-separated: "concurrency,operational"
+            local valid_views=""
+            local all_views="context functional information concurrency development deployment operational"
+            
+            IFS=',' read -ra VIEWS_ARRAY <<< "$views_arg"
+            for view in "${VIEWS_ARRAY[@]}"; do
+                view=$(echo "$view" | tr -d ' ')  # Trim whitespace
+                # Check if view is valid
+                if echo "$all_views" | grep -qw "$view"; then
+                    valid_views="$valid_views $view"
+                fi
+            done
+            
+            # Always include core views
+            for view in context functional information development deployment; do
+                if ! echo "$valid_views" | grep -qw "$view"; then
+                    valid_views="$valid_views $view"
+                fi
+            done
+            
+            echo "$valid_views" | sed 's/^ *//'
+            ;;
+    esac
+}
+
+# ============================================================================
+# Hybrid ADR Storage Helpers (v2.2.0)
+# ============================================================================
+
+# ADRs are always stored as individual files (ADR-{NNN}.md) in a directory
+detect_adr_format() {
+    echo "hybrid"
+}
+
+# Parse a YAML frontmatter field from a markdown file (MADR 3.0.0 frontmatter).
+# Usage: parse_fm_field "file" "fieldname"
+# Returns the field value with quotes, inline comments, and surrounding whitespace stripped.
+parse_fm_field() {
+    local file="$1"
+    local field="$2"
+    awk -v fld="^[[:space:]]*$2:[[:space:]]*" '
+        /^---[[:space:]]*$/ { fm++; next }
+        fm == 1 && $0 ~ fld {
+            # strip the "key:" prefix
+            sub(fld, "")
+            # strip inline YAML comments
+            sub(/[[:space:]]+#.*$/, "")
+            # strip surrounding quotes
+            gsub(/^["'\'']|["'\'']$/, "")
+            # strip list brackets / leading "- "
+            gsub(/^\[|\]$/, "")
+            # trim
+            sub(/^[[:space:]]+/, ""); sub(/[[:space:]]+$/, "")
+            print
+            exit
+        }
+    ' "$file"
+}
+
+# Extract the MADR H1 title (first "# " line after frontmatter) from a markdown file.
+# Usage: parse_fm_title "file"
+parse_fm_title() {
+    awk '/^---[[:space:]]*$/ { fm++; next } fm >= 2 && /^#[[:space:]]+/ { sub(/^#[[:space:]]+/, ""); sub(/[[:space:]]+$/, ""); print; exit }' "$1"
+}
+
+# next_adr_number [ROOT] - the next free ADR ledger slot.
+#
+# Same contract as next_record_number in product-clarify's pdr-lib.sh: the
+# number is the LEADING DIGITS of the filename stem (ADR-003-amendment-2.md is record
+# 003; suffixes are never arithmetically parsed), and the maximum spans drafts
+# AND published memory so a promoted record's slot is not reissued.
+#
+# Deliberately not one shared implementation: the source tree is
+# skills/<group>/<skill>/ while the installed mirror is flat
+# .agents/skills/<skill>/, so no single relative source path resolves in both --
+# which is why parse_fm_field is duplicated here and in pdr-lib.sh too.
+# tests/unit/test_ledger_slot_numbering.py pins the behaviour in both homes.
+next_adr_number() {
+    local root="${1:-$REPO_ROOT}"
+    local max=0 f num dir
+    for dir in "$root/.adlc/drafts/adr" "$root/${DOCS_ADLC_MEMORY:-docs/adlc/memory}/adr"; do
+        [[ -d "$dir" ]] || continue
+        for f in "$dir"/ADR-*.md; do
+            [[ -f "$f" ]] || continue
+            num=$(basename "$f" .md | sed -n 's/^ADR-\([0-9]\{1,\}\).*/\1/p')
+            [[ -n "$num" ]] || continue
+            ((10#$num > max)) && max=$((10#$num))
+        done
+    done
+    printf '%03d' "$((max + 1))"
+}
+
+# next_ad_delta_version AD_FILE - the next `## vN.N.N Delta:` heading version.
+#
+# Deltas bump the MINOR and reset the patch: v13.18.0 -> v13.19.0. A patch
+# bump (v13.3.1) means amending the delta that is already there, which is a
+# deliberate act, not the next free slot -- so this never emits one.
+#
+# Companion to next_prd_section/next_req_id/next_feature_number in
+# product-clarify's pdr-lib.sh: those scan PRD.md, this scans AD.md. Split for
+# the same reason the index generators are -- the source tree is
+# skills/<group>/<skill>/ while the installed mirror is flat
+# .agents/skills/<skill>/, so no one relative source path resolves in both.
+next_ad_delta_version() {
+    local f="${1:-}"
+    local major=0 minor=0 patch=0 max=""
+    if [[ -f "$f" ]]; then
+        max=$(grep -oE '^## v[0-9]+\.[0-9]+\.[0-9]+ Delta' "$f" \
+            | sed -E 's/^## v([0-9]+)\.([0-9]+)\.([0-9]+) Delta/\1 \2 \3/' \
+            | sort -k1,1n -k2,2n -k3,3n | tail -1)
+    fi
+    if [[ -n "$max" ]]; then
+        read -r major minor patch <<< "$max"
+    fi
+    printf 'v%s.%s.0' "$major" "$((minor + 1))"
+}
+
+# Generate adr.md index from individual ADR files
+generate_adr_index() {
+    local scope="${1:-drafts}"
+    local adr_dir="$REPO_ROOT/.adlc/$scope/adr"
+
+    # dual-read: the memory scope indexes the canonical
+    # docs/adlc/memory root plus any records still in the legacy .adlc/memory
+    # root (migration stragglers). The index is written where the records
+    # live — docs preferred whenever it holds any record, else legacy.
+    local scan_dirs=("$adr_dir")
+    if [[ "$scope" == "memory" ]]; then
+        local docs_adr_dir="$REPO_ROOT/${DOCS_ADLC_MEMORY:-docs/adlc/memory}/adr"
+        if compgen -G "$docs_adr_dir/ADR-*.md" >/dev/null 2>&1; then
+            scan_dirs=("$docs_adr_dir" "$adr_dir")
+        fi
+    fi
+
+    local index_file="${scan_dirs[0]}/adr.md"
+
+    if [[ ! -d "${scan_dirs[0]}" ]]; then
+        return 0
+    fi
+
+    local index_content="# Architecture Decision Records
+
+## ADR Index
+
+| ID | Sub-System | Decision | Status | Date | Decision Makers | File |
+|----|------------|----------|--------|------|------------------|------|
+"
+
+    local quick_links=$'\n---\n\n## Quick Links\n\n'
+
+    # Lexical filename sort (repo names are zero-padded: amendment-before-base
+    # order falls out naturally). IDs are filename stems verbatim — suffixes
+    # (e.g. -amendment-2) are preserved, never arithmetically parsed.
+    local _adr_index_files=""
+    local _d
+    for _d in "${scan_dirs[@]}"; do
+        [[ -d "$_d" ]] || continue
+        _adr_index_files+="$(ls -1 "$_d"/ADR-*.md 2>/dev/null || true)"$'\n'
+    done
+    for f in $(printf '%s' "$_adr_index_files" | LC_ALL=C sort); do
+        local fname
+        fname=$(basename "$f")
+        local stem="${fname%.md}"
+        local id="${stem#ADR-}"
+        # Purely numeric stems keep the legacy zero-padded display; suffixed
+        # stems render verbatim (printf %03d on them printed ADR-000).
+        local disp="$id"
+        if [[ "$id" =~ ^[0-9]+$ ]]; then
+            disp=$(printf "%03d" "$((10#$id))")
+        fi
+
+        # Extract metadata from MADR frontmatter (fallback to empty + defaults)
+        local title=""
+        local subsystem=""
+        local status=""
+        local date=""
+        local decision_makers=""
+
+        title=$(parse_fm_title "$f")
+        status=$(parse_fm_field "$f" "status")
+        date=$(parse_fm_field "$f" "date")
+        decision_makers=$(parse_fm_field "$f" "decision-makers")
+        subsystem=$(parse_fm_field "$f" "sub-system")
+
+        # Defaults
+        [[ -z "$status" ]] && status="Proposed"
+        [[ -z "$date" ]] && date="YYYY-MM-DD"
+        [[ -z "$decision_makers" ]] && decision_makers=""
+        [[ -z "$subsystem" ]] && subsystem="System"
+        [[ -z "$title" ]] && title="ADR-$id"
+
+        index_content+="| ADR-$disp | $subsystem | $title | $status | $date | $decision_makers | [$fname]($fname) |\n"
+        quick_links+="- [ADR-$disp: $title]($fname)\n"
+    done
+
+    echo -e "${index_content}\n${quick_links}" > "$index_file"
+}
+
+
+# Read a single ADR by ID
+get_adr_by_id() {
+    local adr_id="$1"
+    adr_id="${adr_id#ADR-}"
+    local scope="${2:-drafts}"
+    local adr_dir="$REPO_ROOT/.adlc/$scope/adr"
+
+    # dual-read: the memory scope searches the canonical
+    # docs/adlc/memory root first, then the legacy .adlc/memory root
+    # (both are checked per file so migration stragglers are found even
+    # when the docs dir already exists).
+    local search_dirs=("$adr_dir")
+    if [[ "$scope" == "memory" ]]; then
+        search_dirs=("$REPO_ROOT/${DOCS_ADLC_MEMORY:-docs/adlc/memory}/adr" "$adr_dir")
+    fi
+
+    # Resolve exact stems first (ADR-<given>.md verbatim); numeric fallback
+    # only for bare IDs. Never strip suffixes (386-amendment-2 is not 3862).
+    # Reject path separators outright (the old digit-strip sanitized by
+    # accident; keep traversal impossible explicitly).
+    case "$adr_id" in *"/"*|.*) return 1;; esac
+    local _d hybrid_file
+    for _d in "${search_dirs[@]}"; do
+        hybrid_file="$_d/ADR-$adr_id.md"
+        if [[ -f "$hybrid_file" ]]; then
+            cat "$hybrid_file"
+            return 0
+        fi
+        if [[ "$adr_id" =~ ^[0-9]+$ ]]; then
+            local padded_id
+            padded_id=$(printf "%03d" "$((10#$adr_id))")
+            hybrid_file="$_d/ADR-$padded_id.md"
+            if [[ -f "$hybrid_file" ]]; then
+                cat "$hybrid_file"
+                return 0
+            fi
+        fi
+    done
+
+    return 1
+}
+
+# List all ADR IDs
+list_adrs() {
+    local scope="${1:-drafts}"
+    local adr_dir="$REPO_ROOT/.adlc/$scope/adr"
+
+    if [[ "$scope" == "memory" ]]; then
+        # dual-read: list the canonical docs/adlc/memory root and
+        # the legacy .adlc/memory root.
+        local _docs_dir="$REPO_ROOT/${DOCS_ADLC_MEMORY:-docs/adlc/memory}/adr"
+        { ls -1 "$_docs_dir"/ADR-*.md "$adr_dir"/ADR-*.md 2>/dev/null || true; } | sed -E 's#.*/##; s/\.md$//' | LC_ALL=C sort
+    elif [[ -d "$adr_dir" ]]; then
+        ls -1 "$adr_dir"/ADR-*.md 2>/dev/null | sed -E 's#.*/##; s/\.md$//' | LC_ALL=C sort
+    fi
+}
+
+# Get ADR count
+get_adr_count() {
+    local scope="${1:-drafts}"
+    local adr_dir="$REPO_ROOT/.adlc/$scope/adr"
+
+    if [[ "$scope" == "memory" ]]; then
+        # dual-read: sum the canonical docs/adlc/memory root and
+        # the legacy .adlc/memory root.
+        local _docs_dir="$REPO_ROOT/${DOCS_ADLC_MEMORY:-docs/adlc/memory}/adr"
+        echo $(( $(ls -1 "$_docs_dir"/ADR-*.md 2>/dev/null | wc -l) + $(ls -1 "$adr_dir"/ADR-*.md 2>/dev/null | wc -l) ))
+    elif [[ -d "$adr_dir" ]]; then
+        ls -1 "$adr_dir"/ADR-*.md 2>/dev/null | wc -l
+    else
+        echo "0"
+    fi
+}
+
+# Write a single ADR to disk (regenerates adr.md index)
+write_adr() {
+    local adr_id="$1"
+    adr_id="${adr_id#ADR-}"
+    local adr_content="$2"
+    local scope="${3:-drafts}"
+    local adr_dir="$REPO_ROOT/.adlc/$scope/adr"
+
+    mkdir -p "$adr_dir"
+
+    local target_name
+    if [[ "$adr_id" =~ ^[0-9]+$ ]]; then
+        target_name="ADR-$(printf "%03d" "$((10#$adr_id))").md"
+    else
+        case "$adr_id" in *"/"*|.*) echo "write_adr: invalid id: $adr_id" >&2; return 1;; esac
+        target_name="ADR-$adr_id.md"
+    fi
+
+    echo "$adr_content" > "$adr_dir/$target_name"
+
+    # Regenerate derived artifacts
+    generate_adr_index "$scope"
+}
+
+# Move ADR from one scope to another (e.g., drafts -> memory)
+move_adr() {
+    local adr_id="$1"
+    adr_id="${adr_id#ADR-}"
+    local from_scope="${2:-drafts}"
+    local to_scope="${3:-memory}"
+
+    local from_dir="$REPO_ROOT/.adlc/$from_scope/adr"
+    local to_dir="$REPO_ROOT/.adlc/$to_scope/adr"
+    # dual-read: promotion writers write the NEW path only — the memory
+    # scope targets docs/adlc/memory (readers dual-read the legacy root).
+    if [[ "$to_scope" == "memory" ]]; then
+        to_dir="$REPO_ROOT/${DOCS_ADLC_MEMORY:-docs/adlc/memory}/adr"
+    fi
+
+    case "$adr_id" in *"/"*|.*) echo "move_adr: invalid id: $adr_id" >&2; return 1;; esac
+
+    mkdir -p "$to_dir"
+
+    # Exact stem first; numeric fallback only for bare IDs.
+    local src_file="$from_dir/ADR-$adr_id.md"
+    if [[ ! -f "$src_file" ]] && [[ "$adr_id" =~ ^[0-9]+$ ]]; then
+        src_file="$from_dir/ADR-$(printf "%03d" "$((10#$adr_id))").md"
+    fi
+    if [[ -f "$src_file" ]]; then
+        mv "$src_file" "$to_dir/$(basename "$src_file")"
+    else
+        echo "[ERROR] move_adr: source file not found: $src_file" >&2
+        return 1
+    fi
+
+    # Regenerate both scopes
+    generate_adr_index "$from_scope"
+    generate_adr_index "$to_scope"
+}
+
+# ============================================================================
+# Diagram generation
+# ============================================================================
+
+# Function to generate and insert diagrams into architecture.md
+generate_and_insert_diagrams() {
+    local arch_file="$1"
+    local system_name="${2:-System}"
+    local views_list="${3:-$ARCHITECTURE_VIEWS}"
+    
+    # Dirty-worktree guard (CDR-002): regeneration overwrites uncommitted
+    # AD.md/content changes. Read-only callers must never trigger it, and
+    # update actions refuse on a dirty worktree unless explicitly forced
+    # with FORCE_REGENERATE=1.
+    if [[ -d "$REPO_ROOT/.git" ]] && command -v git &> /dev/null; then
+        if ! git -C "$REPO_ROOT" diff --quiet -- "$arch_file" 2>/dev/null \
+           || ! git -C "$REPO_ROOT" diff --cached --quiet -- "$arch_file" 2>/dev/null; then
+            if [[ "${FORCE_REGENERATE:-0}" != "1" ]]; then
+                echo "❌ Refusing to regenerate diagrams: $arch_file has uncommitted changes." >&2
+                echo "   Commit or stash first, or re-run with FORCE_REGENERATE=1 to overwrite." >&2
+                return 1
+            fi
+            echo "⚠️  FORCE_REGENERATE=1: regenerating despite uncommitted changes to $arch_file" >&2
+        fi
+    fi
+    
+    # Parse views
+    local parsed_views
+    parsed_views=$(parse_views "$views_list")
+    
+    echo "📊 Generating architecture diagrams..." >&2
+    echo "   Views: $parsed_views" >&2
+    
+    # Get diagram format from config
+    local diagram_format
+    diagram_format=$(get_architecture_diagram_format)
+    
+    echo "   Using diagram format: $diagram_format" >&2
+    
+    # Source diagram generators
+    local generator_dir="$SCRIPT_DIR"
+    if [[ "$diagram_format" == "mermaid" ]]; then
+        source "$generator_dir/mermaid-generator.sh"
+    else
+        source "$generator_dir/ascii-generator.sh"
+    fi
+    
+    # Generate each diagram and insert into template
+    for view in $parsed_views; do
+        echo "   Generating ${view} view diagram..." >&2
+        
+        local diagram_code
+        if [[ "$diagram_format" == "mermaid" ]]; then
+            diagram_code=$(generate_mermaid_diagram "$view" "$system_name")
+            
+            # Validate Mermaid syntax
+            if ! validate_mermaid_syntax "$diagram_code"; then
+                echo "   ⚠️  Mermaid validation failed for ${view} view, using ASCII fallback" >&2
+                source "$generator_dir/ascii-generator.sh"
+                diagram_code=$(generate_ascii_diagram "$view" "$system_name")
+                diagram_format="ascii"
+            fi
+        else
+            diagram_code=$(generate_ascii_diagram "$view" "$system_name")
+        fi
+        
+        # Create the diagram block with appropriate markdown
+        local diagram_block
+        if [[ "$diagram_format" == "mermaid" ]]; then
+            diagram_block="\`\`\`mermaid
+$diagram_code
+\`\`\`"
+        else
+            diagram_block="\`\`\`text
+$diagram_code
+\`\`\`"
+        fi
+        
+        # Insert diagram into the architecture file at appropriate location
+        # This is a simplified insertion - AI agent via architect.md template will do the real work
+        # We're just providing the diagram generation capability here
+    done
+    
+    echo "✅ Diagram generation complete" >&2
+}
+
+# Action: Specify (greenfield - interactive PRD exploration to create ADRs)
+action_specify() {
+    local adr_dir="$REPO_ROOT/${ADLC_DRAFTS:-.adlc/drafts}/adr"
+    local adr_dir="$REPO_ROOT/${ADLC_DRAFTS:-.adlc/drafts}/adr"
+    local adr_template="$REPO_ROOT/.adlc/templates/adr-template.md"
+
+    echo "📐 Setting up for interactive ADR creation..." >&2
+
+    # Ensure drafts directory exists
+    mkdir -p "$REPO_ROOT/${ADLC_DRAFTS:-.adlc/drafts}"
+
+
+    # Show decomposition status
+    if [[ "$DECOMPOSE" == "true" ]]; then
+        echo "" >&2
+        echo "🔄 Sub-system decomposition: ENABLED" >&2
+        echo "   (AI agent will detect domains from PRD and propose sub-systems)" >&2
+    else
+        echo "" >&2
+        echo "⚠️  Sub-system decomposition: DISABLED (--no-decompose flag)" >&2
+        echo "   (AI agent will generate monolithic ADRs)" >&2
+    fi
+
+    # Initialize hybrid ADR directory if empty
+    local adr_count
+    adr_count=$(get_adr_count "drafts")
+    if [[ "$adr_count" -eq 0 ]]; then
+        if [[ -f "$adr_template" ]]; then
+            echo "Creating ADR template for hybrid storage..." >&2
+            # Write template as a placeholder ADR-000 that agents will replace
+            mkdir -p "$adr_dir"
+            cp "$adr_template" "$adr_dir/ADR-000.md"
+            echo "✅ Initialized hybrid ADR directory: $adr_dir" >&2
+        else
+            mkdir -p "$adr_dir"
+            echo "✅ Created hybrid ADR directory: $adr_dir" >&2
+        fi
+    else
+        echo "✅ Found $adr_count existing ADR(s)" >&2
+    fi
+
+    echo "" >&2
+    echo "Ready for interactive PRD exploration." >&2
+    echo "The AI agent will:" >&2
+    if [[ "$DECOMPOSE" == "true" ]]; then
+        echo "  0. (Phase 0) Detect domains in PRD and propose sub-systems" >&2
+        echo "     → Ask user to confirm sub-system breakdown" >&2
+    fi
+    echo "  1. Analyze your PRD/requirements input" >&2
+    echo "  2. Ask clarifying questions about architecture" >&2
+    echo "  3. Create ADRs for each key decision" >&2
+    echo "  4. Save decisions to .adlc/drafts/adr/ADR-{NNN}.md (Proposed status)" >&2
+    echo "     (ADRs will be moved to memory/team after /architect-implement)" >&2
+    if [[ "$DECOMPOSE" == "true" ]]; then
+        echo "  5. Organize ADRs by sub-system" >&2
+    fi
+    echo "" >&2
+    echo "After completion, run '/architect-implement' to generate full AD.md" >&2
+
+    # Ledger slot allocation: hand callers the next free slot (leading digits
+    # of the filename stem, max across drafts AND published memory -- see
+    # next_adr_number). Leaving "the highest existing number" to the agent
+    # reissued taken slots.
+    local next_adr
+    next_adr=$(next_adr_number "$REPO_ROOT")
+    echo "" >&2
+    echo "Next free ADR slot: ADR-$next_adr" >&2
+
+    if $JSON_MODE; then
+        jq -n \
+          --arg adr_dir "$adr_dir" \
+          --arg context "${ARGS[*]}" \
+          --arg decomposition "$DECOMPOSE" \
+          --arg next_adr "$next_adr" \
+          '{status:"success",action:"specify",adr_dir:$adr_dir,context:$context,decomposition:$decomposition,next_adr:$next_adr}'
+    fi
+}
+
+# Action: Clarify (refine existing ADRs)
+action_clarify() {
+    # Auto-migrate both scopes before loading
+
+
+    # Check drafts first (primary working location), fall back to memory if drafts is empty.
+    # dual-read: the memory fallback prefers docs/adlc/memory and
+    # falls back to legacy .adlc/memory.
+    local adr_dir="$REPO_ROOT/${ADLC_DRAFTS:-.adlc/drafts}/adr"
+    local adr_dir="$REPO_ROOT/${ADLC_DRAFTS:-.adlc/drafts}/adr"
+    local fallback_adr_dir="$REPO_ROOT/${DOCS_ADLC_MEMORY:-docs/adlc/memory}/adr"
+    if [[ ! -d "$fallback_adr_dir" ]]; then
+        fallback_adr_dir="$REPO_ROOT/.adlc/memory/adr"
+    fi
+
+    local active_dir="$adr_dir"
+    local active_dir="$adr_dir"
+    local active_scope="drafts"
+
+    local draft_count
+    draft_count=$(get_adr_count "drafts")
+    local memory_count
+    memory_count=$(get_adr_count "memory")
+
+    if [[ "$draft_count" -eq 0 ]]; then
+        if [[ "$memory_count" -gt 0 ]]; then
+            echo "ℹ️  Drafts ADR file not found, using memory ADRs" >&2
+            active_dir="$fallback_adr_dir"
+            active_dir="$fallback_adr_dir"
+            active_scope="memory"
+        else
+            echo "❌ ADR directory does not exist: $adr_dir" >&2
+            echo "Run '/architect-specify' or '/architect-init' first" >&2
+            exit 1
+        fi
+    fi
+
+    local adr_count
+    adr_count=$(get_adr_count "$active_scope")
+    local format
+    format=$(detect_adr_format "$active_scope")
+
+    echo "🔍 Loading existing ADRs for clarification..." >&2
+    echo "Found $adr_count ADR(s) in $active_dir (format: $format)" >&2
+
+    echo "" >&2
+    echo "Ready for ADR refinement." >&2
+    echo "The AI agent will:" >&2
+    echo "  1. Review existing ADRs" >&2
+    echo "  2. Ask targeted clarification questions" >&2
+    echo "  3. Update ADRs based on your responses" >&2
+    echo "  4. Regenerate adr.md index after updates" >&2
+    echo "  5. Flag any inconsistencies or gaps" >&2
+
+    if $JSON_MODE; then
+        jq -n \
+          --arg adr_dir "$adr_dir" \
+          --argjson adr_count "$adr_count" \
+          --arg format "$format" \
+          --arg context "${ARGS[*]}" \
+          '{status:"success",action:"clarify",adr_dir:$adr_dir,adr_count:$adr_count,format:$format,context:$context}'
+    fi
+}
+
+# Action: Implement (generate full AD.md from ADRs)
+action_implement() {
+    local adr_dir="$REPO_ROOT/${ADLC_DRAFTS:-.adlc/drafts}/adr"
+    local ad_file="$REPO_ROOT/${DOCS_ADLC_ARCHITECT:-docs/adlc/architect}/AD.md"
+    local ad_template="$REPO_ROOT/.adlc/templates/AD-template.md"
+    
+    # Auto-migrate before checking
+
+    local adr_count
+    adr_count=$(get_adr_count "drafts")
+
+    if [[ "$adr_count" -eq 0 ]]; then
+        echo "❌ No ADR drafts found" >&2
+        echo "Run '/architect-specify' or '/architect-init' first" >&2
+        exit 1
+    fi
+
+    # Ledger slot: the next vN.N.N Delta heading in the existing AD.md.
+    local next_delta
+    next_delta=$(next_ad_delta_version "$ad_file")
+
+    if [[ "${PREVIEW:-false}" == "true" ]]; then
+        echo "Preview (no writes): would init $ad_file from template," >&2
+        echo "  generate views per sub-system, move Accepted ADRs" >&2
+        echo "  $adr_dir -> docs/adlc/memory/adr/, regenerate both indexes." >&2
+        if $JSON_MODE; then
+            jq -n -c \
+              --arg adr_dir "$adr_dir" \
+              --arg ad_file "$ad_file" \
+              --argjson adr_count "$adr_count" \
+              --arg context "${ARGS[*]}" \
+              --arg next_ad_delta_version "$next_delta" \
+              '{status:"success",action:"implement",preview:true,adr_dir:$adr_dir,ad_file:$ad_file,adr_count:$adr_count,context:$context,next_ad_delta_version:$next_ad_delta_version}'
+        fi
+        return 0
+    fi
+
+    echo "📐 Setting up for Architecture Description generation..." >&2
+
+    # Initialize AD.md from template if it doesn't exist
+    if [[ ! -f "$ad_file" ]]; then
+        if [[ -f "$ad_template" ]]; then
+            echo "Creating AD.md from template..." >&2
+            mkdir -p "$(dirname "$ad_file")"
+            cp "$ad_template" "$ad_file"
+            echo "✅ Created: $ad_file" >&2
+        else
+            echo "⚠️  AD template not found: $ad_template" >&2
+            echo "The AI agent will create AD.md from scratch" >&2
+        fi
+    else
+        echo "✅ AD.md already exists, will be updated: $ad_file" >&2
+    fi
+
+    echo "" >&2
+    echo "Ready for Architecture Description generation." >&2
+    echo "The AI agent will:" >&2
+    echo "  1. Read all $adr_count ADR(s) from .adlc/drafts/adr/" >&2
+    echo "  2. Generate 7 Rozanski & Woods viewpoints" >&2
+    echo "  3. Apply Security and Performance perspectives" >&2
+    echo "  4. Create Mermaid diagrams for each view" >&2
+    echo "  5. Write complete AD.md to docs/adlc/architect/" >&2
+    echo "  6. Move Accepted ADRs to canonical location (docs/adlc/memory/adr/)" >&2
+    echo "  7. Regenerate adr.md index for both scopes" >&2
+    echo "  8. Clean up drafts if all ADRs are Accepted" >&2
+
+    if $JSON_MODE; then
+        jq -n \
+          --arg adr_dir "$adr_dir" \
+          --arg ad_file "$ad_file" \
+          --argjson adr_count "$adr_count" \
+          --arg context "${ARGS[*]}" \
+          --arg next_ad_delta_version "$next_delta" \
+          '{status:"success",action:"implement",adr_dir:$adr_dir,ad_file:$ad_file,adr_count:$adr_count,context:$context,next_ad_delta_version:$next_ad_delta_version}'
+    fi
+}
+
+# Action: Initialize (brownfield - reverse-engineer from codebase, ADRs only)
+action_init() {
+    local adr_dir="$REPO_ROOT/${ADLC_DRAFTS:-.adlc/drafts}/adr"
+    local adr_dir="$REPO_ROOT/${ADLC_DRAFTS:-.adlc/drafts}/adr"
+    local adr_template="$REPO_ROOT/.adlc/templates/adr-template.md"
+
+    echo "🔍 Initializing brownfield architecture discovery..." >&2
+
+    # Ensure drafts directory exists
+    mkdir -p "$REPO_ROOT/${ADLC_DRAFTS:-.adlc/drafts}"
+
+
+    # Scan existing docs for deduplication
+    local existing_docs
+    existing_docs=$(scan_existing_docs "$REPO_ROOT")
+    if [[ -n "$existing_docs" ]]; then
+        echo "📋 Found existing documentation:" >&2
+        echo "$existing_docs" | while read -r line; do
+            echo "  - $line" >&2
+        done
+        echo "" >&2
+    fi
+
+    # Detect tech stack for context
+    echo "🔍 Scanning codebase..." >&2
+    local tech_stack
+    tech_stack=$(detect_tech_stack)
+
+    local dir_structure
+    dir_structure=$(map_directory_structure)
+
+    # Phase 0: Sub-system detection (if decomposition enabled)
+    local subsystems_json=""
+    local decompose_status="disabled"
+
+    if [[ "$DECOMPOSE" == "true" ]]; then
+        echo "" >&2
+        echo "🔄 Phase 0: Sub-System Detection" >&2
+        subsystems_json=$(detect_subsystems)
+        decompose_status="enabled"
+
+        if [[ -n "$subsystems_json" ]] && [[ "$subsystems_json" != "[]" ]]; then
+            echo "" >&2
+            echo "📦 Sub-systems will be used to organize ADRs" >&2
+            echo "   (AI agent will confirm with user before proceeding)" >&2
+        fi
+    else
+        echo "" >&2
+        echo "⚠️  Sub-system decomposition disabled (--no-decompose flag)" >&2
+    fi
+
+    # Initialize hybrid ADR directory if empty
+    local adr_count
+    adr_count=$(get_adr_count "drafts")
+    if [[ "$adr_count" -eq 0 ]]; then
+        mkdir -p "$adr_dir"
+        if [[ -f "$adr_template" ]]; then
+            echo "Creating ADR template for hybrid storage..." >&2
+            cp "$adr_template" "$adr_dir/ADR-000.md"
+            echo "✅ Initialized hybrid ADR directory: $adr_dir" >&2
+        else
+            echo "✅ Created hybrid ADR directory: $adr_dir" >&2
+        fi
+    else
+        echo "✅ Found $adr_count existing ADR(s)" >&2
+    fi
+
+    echo "" >&2
+    echo "📊 Codebase Analysis Summary:" >&2
+    echo "$tech_stack" >&2
+    echo "" >&2
+    echo "$dir_structure" >&2
+
+    echo "" >&2
+    echo "Ready for brownfield architecture discovery." >&2
+    echo "The AI agent will:" >&2
+    if [[ "$DECOMPOSE" == "true" ]]; then
+        echo "  0. (Phase 0) Propose sub-systems from code structure" >&2
+        echo "     → Ask user to confirm sub-system breakdown" >&2
+    fi
+    echo "  1. Analyze codebase structure and patterns" >&2
+    echo "  2. Infer architectural decisions from code" >&2
+    echo "  3. Create ADRs marked as 'Discovered (Inferred)'" >&2
+    if [[ "$DECOMPOSE" == "true" ]]; then
+        echo "  4. Organize ADRs by sub-system" >&2
+    fi
+    echo "  5. Auto-trigger /architect-clarify to validate findings" >&2
+    echo "" >&2
+    echo "NOTE: AD.md will NOT be created until ADRs are validated." >&2
+    echo "      After clarification, run /architect-implement to generate AD.md" >&2
+
+    if $JSON_MODE; then
+        # _sub_raw is a prebuilt JSON array → pass via --argjson.
+        local _sub_raw="$subsystems_json"
+        [[ -z "${_sub_raw//[[:space:]]/}" ]] && _sub_raw="[]"
+        jq -n \
+          --arg adr_dir "$adr_dir" \
+          --arg tech_stack "$tech_stack" \
+          --arg existing_docs "$existing_docs" \
+          --arg decomposition "$decompose_status" \
+          --argjson subsystems "$_sub_raw" \
+          '{status:"success",action:"init",adr_dir:$adr_dir,tech_stack:$tech_stack,existing_docs:$existing_docs,source:"brownfield",decomposition:$decomposition,subsystems:$subsystems}'
+    fi
+}
+
+# Action: Map (brownfield)
+action_map() {
+    echo "🔍 Mapping existing codebase to architecture..." >&2
+    
+    # Scan existing docs
+    local existing_docs
+    existing_docs=$(scan_existing_docs "$REPO_ROOT")
+    
+    # Detect tech stack
+    echo "" >&2
+    echo "Tech Stack Detected:" >&2
+    tech_stack=$(detect_tech_stack)
+    echo "$tech_stack" >&2
+    
+    # Map directory structure
+    echo "" >&2
+    echo "Code Organization:" >&2
+    dir_structure=$(map_directory_structure)
+    echo "$dir_structure" >&2
+    
+    # Extract API endpoints
+    echo "" >&2
+    extract_api_endpoints >&2
+    
+    # Output structured data for AI agent to populate AD.md
+    if $JSON_MODE; then
+        jq -n \
+          --arg tech_stack "$tech_stack" \
+          --arg directory_structure "$dir_structure" \
+          --arg existing_docs "$existing_docs" \
+          '{status:"success",action:"map",tech_stack:$tech_stack,directory_structure:$directory_structure,existing_docs:$existing_docs}'
+    else
+        echo "" >&2
+        echo "📋 Mapping complete. Use this information to populate AD.md:" >&2
+        
+        if [[ -n "$existing_docs" ]]; then
+            echo "" >&2
+            echo "Existing Documentation (reference, don't duplicate):" >&2
+            echo "$existing_docs" | while read -r line; do
+                echo "  - $line" >&2
+            done
+        fi
+        
+        echo "" >&2
+        echo "Architecture Sections:" >&2
+        echo "  - Context View (3.1): Define system boundaries" >&2
+        echo "  - Development View (3.5): Use directory structure above" >&2
+        echo "  - Deployment View (3.6): Check docker-compose.yml, k8s configs, terraform" >&2
+        echo "  - Functional View (3.2): Use API endpoints detected" >&2
+        echo "  - Information View (3.3): Check database schemas, ORM models" >&2
+    fi
+}
+
+# Action: Update
+action_update() {
+    if [[ ! -f "$AD_FILE" ]]; then
+        echo "❌ Architecture does not exist: $AD_FILE" >&2
+        echo "Run '/architect-specify' or '/architect-init' first" >&2
+        exit 1
+    fi
+    
+    echo "🔄 Updating architecture based on recent changes..." >&2
+    
+    # Check for recent commits (basic approach)
+    if command -v git &> /dev/null && [[ -d "$REPO_ROOT/.git" ]]; then
+        echo "" >&2
+        echo "Recent changes:" >&2
+        git log --oneline --since="7 days ago" 2>/dev/null | head -10 >&2 || true
+    fi
+    
+    # Detect changes in tech stack
+    echo "" >&2
+    echo "Current Tech Stack:" >&2
+    detect_tech_stack >&2
+    
+    # Regenerate diagrams with current format and views
+    generate_and_insert_diagrams "$AD_FILE" "System" "$VIEWS"
+    
+    echo "" >&2
+    echo "✅ Update analysis complete" >&2
+    echo "Review the architecture document and update affected sections:" >&2
+    echo "  - New tables/models? → Update Information View" >&2
+    echo "  - New services/components? → Update Functional View + Deployment View" >&2
+    echo "  - New queues/async? → Update Concurrency View (if included)" >&2
+    echo "  - New dependencies? → Update Development View" >&2
+    echo "  - Add ADR if significant decision was made" >&2
+    
+    if $JSON_MODE; then
+        jq -n \
+          --arg ad_file "$AD_FILE" \
+          --arg adr_dir "$adr_dir" \
+          '{status:"success",action:"update",ad_file:$ad_file,adr_dir:$adr_dir}'
+    fi
+}
+
+# Action: Review
+action_review() {
+    if [[ ! -f "$AD_FILE" ]]; then
+        echo "❌ Architecture does not exist: $AD_FILE" >&2
+        echo "Run '/architect-specify' or '/architect-init' first" >&2
+        exit 1
+    fi
+    
+    echo "🔍 Reviewing architecture..." >&2
+    
+    # Check for completeness
+    local issues=()
+    
+    # Check for required sections
+    if ! grep -q "## 1\. Introduction" "$AD_FILE"; then
+        issues+=("Missing: Introduction section")
+    fi
+    
+    if ! grep -q "## 2\. Stakeholders & Concerns" "$AD_FILE"; then
+        issues+=("Missing: Stakeholders section")
+    fi
+    
+    if ! grep -q "## 3\. Architectural Views" "$AD_FILE"; then
+        issues+=("Missing: Architectural Views section")
+    fi
+    
+    if ! grep -q "### 3.1 Context View" "$AD_FILE"; then
+        issues+=("Missing: Context View")
+    fi
+    
+    if ! grep -q "### 3.2 Functional View" "$AD_FILE"; then
+        issues+=("Missing: Functional View")
+    fi
+    
+    if ! grep -q "## 4\. Architectural Perspectives" "$AD_FILE"; then
+        issues+=("Missing: Perspectives section")
+    fi
+    
+    if ! grep -q "## 5\. Global Constraints & Principles" "$AD_FILE"; then
+        issues+=("Missing: Global Constraints section")
+    fi
+    
+    # Check for placeholder content
+    if grep -q "\[SYSTEM_NAME\]" "$AD_FILE"; then
+        issues+=("Placeholder: System name not filled in")
+    fi
+    
+    if grep -q "\[STAKEHOLDER_" "$AD_FILE"; then
+        issues+=("Placeholder: Stakeholders not filled in")
+    fi
+    
+    # Report results
+    if [[ ${#issues[@]} -eq 0 ]]; then
+        echo "✅ Architecture review passed - no major issues found" >&2
+    else
+        echo "⚠️  Architecture review found issues:" >&2
+        for issue in "${issues[@]}"; do
+            echo "  - $issue" >&2
+        done
+    fi
+    
+ # Check constitution alignment if it exists (dual-read)
+ local constitution_file
+ constitution_file=$(_adlc_memory_path "constitution.md")
+    if [[ -f "$constitution_file" ]]; then
+        echo "" >&2
+        echo "📜 Checking constitution alignment..." >&2
+        echo "✅ Constitution file found: $constitution_file" >&2
+        echo "Manually verify that architecture adheres to constitutional principles" >&2
+    fi
+    
+    # Check for ADRs (dual-read)
+    local adr_mem_dir
+    adr_mem_dir=$(_adlc_memory_path "adr")
+    if [[ -d "$adr_mem_dir" ]]; then
+        echo "" >&2
+        echo "📋 ADR directory found: $adr_mem_dir" >&2
+        local adr_count
+        adr_count=$(get_adr_count "memory")
+        echo "   Found $adr_count ADR(s)" >&2
+    fi
+    
+    if $JSON_MODE; then
+        if [[ ${#issues[@]} -eq 0 ]]; then
+            jq -n \
+              --arg ad_file "$AD_FILE" \
+              --arg adr_dir "$adr_mem_dir" \
+              --argjson issues "[]" \
+              '{status:"success",action:"review",ad_file:$ad_file,adr_dir:$adr_dir,issues:$issues}'
+        else
+            # Format issues as JSON array
+            issues_json=$(printf '%s\n' "${issues[@]}" | jq -R . | jq -s .)
+            jq -n \
+              --arg ad_file "$AD_FILE" \
+              --arg adr_dir "$adr_mem_dir" \
+              --argjson issues "$issues_json" \
+              '{status:"warning",action:"review",ad_file:$ad_file,adr_dir:$adr_dir,issues:$issues}'
+        fi
+    fi
+}
+
+# Action: Analyze (validate architecture consistency)
+action_analyze() {
+    echo "🔍 Architecture Analysis Mode" >&2
+    echo ""
+
+    # Auto-migrate before analysis
+
+
+    # dual-read: compiled AD at docs/adlc/architect/AD.md, legacy
+    # repo-root AD.md fallback.
+    local ad_file="$REPO_ROOT/${DOCS_ADLC_ARCHITECT:-docs/adlc/architect}/AD.md"
+    if [[ ! -f "$ad_file" ]]; then ad_file="$REPO_ROOT/AD.md"; fi
+    # dual-read: canonical docs/adlc/memory first, legacy fallback.
+    local adr_dir
+    adr_dir=$(_adlc_memory_path "adr")
+    local constitution_file
+    constitution_file=$(_adlc_memory_path "constitution.md")
+
+    local ad_exists=false
+    local adr_exists=false
+    local constitution_exists=false
+
+    if [[ -f "$ad_file" ]]; then
+        ad_exists=true
+        echo "📄 AD.md found: $ad_file" >&2
+    else
+        echo "⚠️  AD.md not found at $ad_file" >&2
+    fi
+
+    local adr_count
+    adr_count=$(get_adr_count "memory")
+    if [[ "$adr_count" -gt 0 ]]; then
+        adr_exists=true
+        echo "📋 ADR file found: $adr_dir ($adr_count ADRs)" >&2
+    else
+        echo "⚠️  ADR directory not found: $adr_dir" >&2
+    fi
+
+    if [[ -f "$constitution_file" ]]; then
+        constitution_exists=true
+        echo "📜 Constitution found: $constitution_file" >&2
+    fi
+
+    # Scan for feature-level architecture
+    local feature_ads=()
+    local feature_adrs=()
+
+    if [[ -d "$REPO_ROOT/specs" ]]; then
+        while IFS= read -r -d '' f; do
+            feature_ads+=("$f")
+        done < <(find "$REPO_ROOT/specs" -name "AD.md" -print0 2>/dev/null)
+
+        while IFS= read -r -d '' f; do
+            feature_adrs+=("$f")
+        done < <(find "$REPO_ROOT/specs" -name "ADR-*.md" -print0 2>/dev/null)
+
+        if [[ ${#feature_ads[@]} -gt 0 ]]; then
+            echo "📁 Feature ADs found: ${#feature_ads[@]}" >&2
+        fi
+        if [[ ${#feature_adrs[@]} -gt 0 ]]; then
+            echo "📁 Feature ADRs found: ${#feature_adrs[@]}" >&2
+        fi
+    fi
+
+    echo "" >&2
+    echo "Ready for architecture consistency analysis." >&2
+    echo "The AI agent will:" >&2
+    echo "  1. Load all architecture artifacts" >&2
+    echo "  2. Execute detection passes A-G" >&2
+    echo "  3. Assign severity levels to findings" >&2
+    echo "  4. Generate structured analysis report" >&2
+    echo "  5. Suggest remediation actions" >&2
+
+    if $JSON_MODE; then
+        local feature_ads_json="[]"
+        local feature_adrs_json="[]"
+
+        if [[ ${#feature_ads[@]} -gt 0 ]]; then
+            feature_ads_json=$(printf '%s\n' "${feature_ads[@]}" | jq -R . | jq -s .)
+        fi
+        if [[ ${#feature_adrs[@]} -gt 0 ]]; then
+            feature_adrs_json=$(printf '%s\n' "${feature_adrs[@]}" | jq -R . | jq -s .)
+        fi
+
+        # ad_exists/adr_exists/constitution_exists are literal "true"/"false"
+        # strings; pass them via --argjson as JSON booleans. feature_*_json
+        # are prebuilt JSON arrays → pass via --argjson.
+        local _ad_bool=false _adr_bool=false _const_bool=false
+        [[ "$ad_exists" == "true" ]] && _ad_bool=true
+        [[ "$adr_exists" == "true" ]] && _adr_bool=true
+        [[ "$constitution_exists" == "true" ]] && _const_bool=true
+        jq -n \
+          --arg ad_file "$ad_file" \
+          --argjson ad_exists "$_ad_bool" \
+          --arg adr_dir "$adr_dir" \
+          --argjson adr_exists "$_adr_bool" \
+          --arg constitution_file "$constitution_file" \
+          --argjson constitution_exists "$_const_bool" \
+          --argjson feature_ads "$feature_ads_json" \
+          --argjson feature_adrs "$feature_adrs_json" \
+          --arg context "${ARGS[*]}" \
+          '{status:"success",action:"analyze",ad_file:$ad_file,ad_exists:$ad_exists,adr_dir:$adr_dir,adr_exists:$adr_exists,constitution_file:$constitution_file,constitution_exists:$constitution_exists,feature_ads:$feature_ads,feature_adrs:$feature_adrs,context:$context}'
+    fi
+}
+
+# Action: Plan DAG (Phase 1 of implement - generate execution plan)
+action_plan_dag() {
+    local adr_dir="$REPO_ROOT/${ADLC_DRAFTS:-.adlc/drafts}/adr"
+    local adr_dir="$REPO_ROOT/${ADLC_DRAFTS:-.adlc/drafts}/adr"
+    local state_file="$REPO_ROOT/.adlc/architect/state.json"
+    local views_dir="$REPO_ROOT/${DOCS_ADLC_ARCHITECT:-docs/adlc/architect}/views"
+
+    echo "📐 DAG Planning Phase" >&2
+    echo "" >&2
+
+    # Auto-migrate before planning
+
+    local adr_count
+    adr_count=$(get_adr_count "drafts")
+
+    if [[ "$adr_count" -eq 0 ]]; then
+        echo "❌ No ADR drafts found" >&2
+        echo "Run '/architect-specify' or '/architect-init' first" >&2
+        exit 1
+    fi
+
+    # Ensure directories exist (state stays under .adlc/architect; views are
+    # published under docs/adlc/architect/views per the shared layout).
+    mkdir -p "$REPO_ROOT/.adlc/architect"
+    mkdir -p "$views_dir"
+
+    # Extract unique sub-systems from ADR files
+    local subsystems=()
+    if [[ -d "$adr_dir" ]]; then
+        for f in "$adr_dir"/ADR-*.md; do
+            [[ -f "$f" ]] || continue
+            local subsystem=""
+            subsystem=$(parse_fm_field "$f" "sub-system")
+            if [[ -n "$subsystem" && "$subsystem" != "Sub-System" ]]; then
+                local found=false
+                for s in "${subsystems[@]}"; do
+                    if [[ "$s" == "$subsystem" ]]; then
+                        found=true
+                        break
+                    fi
+                done
+                if [[ "$found" == "false" ]]; then
+                    subsystems+=("$subsystem")
+                fi
+            fi
+        done
+    elif [[ -d "$adr_dir" ]]; then
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^\|[[:space:]]*ADR-[0-9]+[[:space:]]*\|[[:space:]]*([^|]+)[[:space:]]*\| ]]; then
+                local subsystem="${BASH_REMATCH[1]}"
+                subsystem=$(echo "$subsystem" | xargs)
+                if [[ -n "$subsystem" && "$subsystem" != "Sub-System" ]]; then
+                    local found=false
+                    for s in "${subsystems[@]}"; do
+                        if [[ "$s" == "$subsystem" ]]; then
+                            found=true
+                            break
+                        fi
+                    done
+                    if [[ "$found" == "false" ]]; then
+                        subsystems+=("$subsystem")
+                    fi
+                fi
+            fi
+        done < "$adr_dir"
+    fi
+
+    # Default to "System" if no sub-systems found
+    if [[ ${#subsystems[@]} -eq 0 ]]; then
+        subsystems=("System")
+    fi
+
+    echo "📋 ADR directory found: $adr_dir" >&2
+    echo "   Found $adr_count ADR(s)" >&2
+    echo "   Sub-systems detected: ${subsystems[*]}" >&2
+    echo "" >&2
+    echo "Ready for DAG planning." >&2
+    echo "The AI agent will:" >&2
+    echo "  1. Analyze ADRs by sub-system" >&2
+    echo "  2. Generate customized DAG per sub-system" >&2
+    echo "  3. Present execution plan for user approval" >&2
+    echo "  4. Save approved plan to state.json" >&2
+
+    if $JSON_MODE; then
+        # Build subsystems JSON array
+        local subsystems_json="["
+        local first=true
+        for s in "${subsystems[@]}"; do
+            if [[ "$first" == "true" ]]; then
+                first=false
+            else
+                subsystems_json+=","
+            fi
+            # Parity with python s.lower().replace(" ","-") for ASCII:
+            # per-char replacement of literal spaces ONLY (tabs preserved;
+            # jq -n encodes them correctly). No sed collapsing. Non-ASCII
+            # case mappings may differ (tr is locale-dependent).
+            local lower slug
+            lower=$(printf '%s' "$s" | tr '[:upper:]' '[:lower:]')
+            slug=${lower// /-}
+            subsystems_json+=$(jq -n -c --arg id "$slug" --arg name "$s" '{id:$id,name:$name}')
+        done
+        subsystems_json+="]"
+
+        # subsystems_json is a prebuilt JSON array → pass via --argjson.
+        jq -n \
+          --arg adr_dir "$adr_dir" \
+          --arg state_file "$state_file" \
+          --arg views_dir "$views_dir" \
+          --argjson adr_count "$adr_count" \
+          --argjson subsystems "$subsystems_json" \
+          --arg context "${ARGS[*]}" \
+          '{status:"success",action:"plan-dag",adr_dir:$adr_dir,state_file:$state_file,views_dir:$views_dir,adr_count:$adr_count,subsystems:$subsystems,context:$context}'
+    fi
+}
+
+# Action: Execute DAG (Phase 2 of implement - generate views based on state)
+action_execute_dag() {
+    local state_file="$REPO_ROOT/.adlc/architect/state.json"
+    local views_dir="$REPO_ROOT/${DOCS_ADLC_ARCHITECT:-docs/adlc/architect}/views"
+
+    echo "🔧 DAG Execution Phase" >&2
+    echo "" >&2
+    
+    # Check if state file exists
+    if [[ ! -f "$state_file" ]]; then
+        echo "❌ No execution plan found: $state_file" >&2
+        echo "Run '/architect-implement' first to generate and approve a DAG plan" >&2
+        exit 1
+    fi
+    
+    # Ensure views directory exists
+    mkdir -p "$views_dir"
+    
+    echo "📄 State file found: $state_file" >&2
+    echo "📁 Views directory: $views_dir" >&2
+    echo "" >&2
+    echo "Ready for DAG execution." >&2
+    echo "The AI agent will:" >&2
+    echo "  1. Read execution plan from state.json" >&2
+    echo "  2. Identify next view(s) to generate" >&2
+    echo "  3. Generate view with dependency context" >&2
+    echo "  4. Write to docs/adlc/architect/views/{subsystem}/{view}.md" >&2
+    echo "  5. Update progress in state.json" >&2
+    
+    if $JSON_MODE; then
+        # Output the state file content for the AI agent
+        if [[ -f "$state_file" ]]; then
+            local state_content
+            state_content=$(cat "$state_file")
+            # state_content is file CONTENT (JSON) → pass via --argjson.
+            jq -n \
+              --arg state_file "$state_file" \
+              --arg views_dir "$views_dir" \
+              --argjson state "$state_content" \
+              '{status:"success",action:"execute-dag",state_file:$state_file,views_dir:$views_dir,state:$state}'
+        else
+            echo "{\"status\":\"error\",\"action\":\"execute-dag\",\"error\":\"state_file_not_found\"}"
+        fi
+    fi
+}
+
+# Action: Summarize (Phase 3 of implement - aggregate views into AD.md)
+action_summarize() {
+    local state_file="$REPO_ROOT/.adlc/architect/state.json"
+    local views_dir="$REPO_ROOT/${DOCS_ADLC_ARCHITECT:-docs/adlc/architect}/views"
+    local ad_file="$REPO_ROOT/${DOCS_ADLC_ARCHITECT:-docs/adlc/architect}/AD.md"
+    local adr_dir="$REPO_ROOT/${ADLC_DRAFTS:-.adlc/drafts}/adr"
+    
+    echo "📝 Summarization Phase" >&2
+    echo "" >&2
+    
+    # Check if views directory exists and has content
+    if [[ ! -d "$views_dir" ]]; then
+        echo "❌ Views directory not found: $views_dir" >&2
+        echo "Run '/architect-implement' to generate views first" >&2
+        exit 1
+    fi
+    
+    # Count view files
+    local view_count
+    view_count=$(find "$views_dir" -name "*.md" -type f 2>/dev/null | wc -l)
+    
+    if [[ "$view_count" -eq 0 ]]; then
+        echo "❌ No view files found in $views_dir" >&2
+        echo "Run '/architect-implement' to generate views first" >&2
+        exit 1
+    fi
+    
+    # List all view files
+    echo "📁 Views directory: $views_dir" >&2
+    echo "   Found $view_count view file(s):" >&2
+    find "$views_dir" -name "*.md" -type f | while read -r f; do
+        echo "   - ${f#$views_dir/}" >&2
+    done
+    echo "" >&2
+    
+    echo "Ready for summarization." >&2
+    echo "The AI agent will:" >&2
+    echo "  1. Read all view files from docs/adlc/architect/views/" >&2
+    echo "  2. Detect cross-subsystem conflicts" >&2
+    echo "  3. Resolve conflicts using ADRs as source of truth" >&2
+    echo "  4. Aggregate into unified AD.md" >&2
+    echo "  5. Apply Security and Performance perspectives" >&2
+    echo "  6. Move Accepted ADRs to canonical location" >&2
+    
+    if $JSON_MODE; then
+        # Build list of view files
+        local views_json="["
+        local first=true
+        while IFS= read -r f; do
+            if [[ "$first" == "true" ]]; then
+                first=false
+            else
+                views_json+=","
+            fi
+            local rel_path="${f#$views_dir/}"
+            views_json+=$(jq -n --arg f "$f" --arg rel "$rel_path" '{"path":$f,"relative":$rel}' | tr -d '\n')
+        done < <(find "$views_dir" -name "*.md" -type f 2>/dev/null)
+        views_json+="]"
+        
+        # views_json is a prebuilt JSON array → pass via --argjson.
+        jq -n \
+          --arg state_file "$state_file" \
+          --arg views_dir "$views_dir" \
+          --arg ad_file "$ad_file" \
+          --arg adr_dir "$adr_dir" \
+          --argjson view_count "$view_count" \
+          --argjson views "$views_json" \
+          '{status:"success",action:"summarize",state_file:$state_file,views_dir:$views_dir,ad_file:$ad_file,adr_dir:$adr_dir,view_count:$view_count,views:$views}'
+    fi
+}
+
+# Action: Validate (READ-ONLY architecture validation for plan alignment)
+action_validate() {
+    # dual-read: canonical docs/adlc/memory first, legacy fallback.
+    local adr_dir
+    adr_dir=$(_adlc_memory_path "adr")
+
+    echo "🔍 Architecture Validation Mode (READ-ONLY)" >&2
+    echo ""
+
+    # Auto-migrate before validation
+
+    local adr_count
+    adr_count=$(get_adr_count "memory")
+
+    # Check if architecture exists
+    if [[ "$adr_count" -eq 0 ]]; then
+        echo "⏭️  Architecture not found: $adr_dir" >&2
+        echo "     Skipping validation gracefully" >&2
+        if $JSON_MODE; then
+            echo "{\"status\":\"skipped\",\"action\":\"validate\",\"reason\":\"architecture_not_found\"}"
+        fi
+        exit 0
+    fi
+
+    echo "📋 ADR directory found: $adr_dir" >&2
+    echo "   Found $adr_count ADR(s)" >&2
+    echo "" >&2
+    echo "Ready for READ-ONLY architecture validation." >&2
+    echo "The AI agent will:" >&2
+    echo "  1. Load architecture from ADRs and AD.md" >&2
+    echo "  2. Validate plan alignment with architecture" >&2
+    echo "  3. Identify blocking/high-severity issues" >&2
+    echo "  4. Report findings (READ-ONLY, no modifications)" >&2
+
+    if $JSON_MODE; then
+        jq -n \
+          --arg adr_dir "$adr_dir" \
+          --argjson adr_count "$adr_count" \
+          --arg context "${ARGS[*]}" \
+          '{status:"success",action:"validate",adr_dir:$adr_dir,adr_count:$adr_count,context:$context}'
+    fi
+}
+
+# Execute action (execution only -- see the sourcing contract above)
+if [[ "$SETUP_ARCHITECT_EXECUTED" == 1 ]]; then
+case "$ACTION" in
+    specify)
+        action_specify
+        ;;
+    clarify)
+        action_clarify
+        ;;
+    init|map)
+        action_init
+        ;;
+    implement)
+        action_implement
+        ;;
+    plan-dag)
+        action_plan_dag
+        ;;
+    execute-dag)
+        action_execute_dag
+        ;;
+    summarize)
+        action_summarize
+        ;;
+    analyze)
+        action_analyze
+        ;;
+    validate)
+        action_validate
+        ;;
+    update)
+        action_update
+        ;;
+    review)
+        action_review
+        ;;
+    *)
+        echo "❌ Unknown action: $ACTION" >&2
+        echo "Use --help for usage information" >&2
+        exit 1
+        ;;
+esac
+fi  # end SETUP_ARCHITECT_EXECUTED (dispatch)
