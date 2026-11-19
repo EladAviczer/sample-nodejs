@@ -9,7 +9,24 @@ resource "aws_ecr_repository" "app" {
   }
 }
 
-# ── GitHub OIDC trust ─────────────────────────────────────────────────────────
+resource "aws_ecr_lifecycle_policy" "app" {
+  repository = aws_ecr_repository.app.name
+
+  policy = jsonencode({
+    rules = [{
+      rulePriority = 1
+      description  = "Keep last 10 images"
+      selection = {
+        tagStatus   = "any"
+        countType   = "imageCountMoreThan"
+        countNumber = 10
+      }
+      action = { type = "expire" }
+    }]
+  })
+}
+
+# ── GitHub Actions OIDC ───────────────────────────────────────────────────────
 
 data "tls_certificate" "github" {
   url = "https://token.actions.githubusercontent.com/.well-known/openid-configuration"
@@ -20,8 +37,6 @@ resource "aws_iam_openid_connect_provider" "github" {
   client_id_list  = ["sts.amazonaws.com"]
   thumbprint_list = [data.tls_certificate.github.certificates[0].sha1_fingerprint]
 }
-
-# ── IAM role for GitHub Actions ───────────────────────────────────────────────
 
 data "aws_iam_policy_document" "github_assume" {
   statement {
@@ -48,7 +63,7 @@ data "aws_iam_policy_document" "github_assume" {
 }
 
 resource "aws_iam_role" "github_actions" {
-  name               = "github-actions-ecr"
+  name               = "github-actions-refael"
   assume_role_policy = data.aws_iam_policy_document.github_assume.json
 }
 
@@ -63,12 +78,12 @@ data "aws_iam_policy_document" "ecr_push" {
     effect = "Allow"
     actions = [
       "ecr:BatchCheckLayerAvailability",
-      "ecr:CompleteLayerUpload",
-      "ecr:InitiateLayerUpload",
-      "ecr:PutImage",
-      "ecr:UploadLayerPart",
-      "ecr:BatchGetImage",
       "ecr:GetDownloadUrlForLayer",
+      "ecr:BatchGetImage",
+      "ecr:InitiateLayerUpload",
+      "ecr:UploadLayerPart",
+      "ecr:CompleteLayerUpload",
+      "ecr:PutImage",
     ]
     resources = [aws_ecr_repository.app.arn]
   }
@@ -80,35 +95,97 @@ resource "aws_iam_role_policy" "ecr_push" {
   policy = data.aws_iam_policy_document.ecr_push.json
 }
 
-# ── ACM certificate + Route53 DNS validation ──────────────────────────────────
+# ── Networking (default VPC) ──────────────────────────────────────────────────
 
-resource "aws_acm_certificate" "ingress" {
-  domain_name       = var.domain_name
-  validation_method = "DNS"
+data "aws_vpc" "default" {
+  default = true
+}
 
-  lifecycle {
-    create_before_destroy = true
+data "aws_subnets" "default" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.default.id]
   }
 }
 
-resource "aws_route53_record" "cert_validation" {
-  for_each = {
-    for dvo in aws_acm_certificate.ingress.domain_validation_options : dvo.domain_name => {
-      name   = dvo.resource_record_name
-      record = dvo.resource_record_value
-      type   = dvo.resource_record_type
-    }
-  }
+# ── EKS Cluster ───────────────────────────────────────────────────────────────
 
-  allow_overwrite = true
-  name            = each.value.name
-  records         = [each.value.record]
-  ttl             = 60
-  type            = each.value.type
-  zone_id         = var.route53_zone_id
+resource "aws_iam_role" "eks_cluster" {
+  name = "eks-cluster-refael"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "eks.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
 }
 
-resource "aws_acm_certificate_validation" "ingress" {
-  certificate_arn         = aws_acm_certificate.ingress.arn
-  validation_record_fqdns = [for record in aws_route53_record.cert_validation : record.fqdn]
+resource "aws_iam_role_policy_attachment" "eks_cluster_policy" {
+  role       = aws_iam_role.eks_cluster.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
+}
+
+resource "aws_eks_cluster" "main" {
+  name     = var.eks_cluster_name
+  role_arn = aws_iam_role.eks_cluster.arn
+  version  = "1.31"
+
+  vpc_config {
+    subnet_ids = data.aws_subnets.default.ids
+  }
+
+  depends_on = [aws_iam_role_policy_attachment.eks_cluster_policy]
+}
+
+# ── EKS Node Group ────────────────────────────────────────────────────────────
+
+resource "aws_iam_role" "eks_node" {
+  name = "eks-node-refael"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "eks_worker_node" {
+  role       = aws_iam_role.eks_node.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
+}
+
+resource "aws_iam_role_policy_attachment" "eks_cni" {
+  role       = aws_iam_role.eks_node.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
+}
+
+resource "aws_iam_role_policy_attachment" "ecr_read_only" {
+  role       = aws_iam_role.eks_node.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+}
+
+resource "aws_eks_node_group" "main" {
+  cluster_name    = aws_eks_cluster.main.name
+  node_group_name = "refael-nodes"
+  node_role_arn   = aws_iam_role.eks_node.arn
+  subnet_ids      = data.aws_subnets.default.ids
+  instance_types  = [var.eks_node_instance_type]
+
+  scaling_config {
+    desired_size = var.eks_desired_nodes
+    min_size     = 1
+    max_size     = 3
+  }
+
+  depends_on = [
+    aws_iam_role_policy_attachment.eks_worker_node,
+    aws_iam_role_policy_attachment.eks_cni,
+    aws_iam_role_policy_attachment.ecr_read_only,
+  ]
 }

@@ -1,25 +1,35 @@
 variable "aws_region" {
-  type    = string
-  default = "us-east-1"
+  description = "AWS region"
+  type        = string
+  default     = "us-east-1"
 }
 
 variable "ecr_repo_name" {
-  type    = string
-  default = "sample-nodejs"
+  description = "ECR repository name"
+  type        = string
+  default     = "sample-nodejs"
 }
 
 variable "github_repo" {
+  description = "GitHub repo in owner/name format (for OIDC trust)"
   type        = string
-  description = "GitHub owner/repo used in OIDC subject claim"
   default     = "OrenOren1/refael"
 }
 
-variable "domain_name" {
+variable "eks_cluster_name" {
+  description = "EKS cluster name"
   type        = string
-  description = "Domain for Ingress TLS cert (e.g. app.example.com)"
+  default     = "refael"
 }
 
-variable "route53_zone_id" {
+variable "eks_node_instance_type" {
+  description = "EC2 instance type for EKS nodes"
   type        = string
-  description = "Route53 hosted zone ID for domain_name"
+  default     = "t3.medium"
+}
+
+variable "eks_desired_nodes" {
+  description = "Desired EKS node count"
+  type        = number
+  default     = 2
 }
