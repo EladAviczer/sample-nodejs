@@ -4,6 +4,12 @@ variable "aws_region" {
   default     = "us-east-1"
 }
 
+variable "aws_profile" {
+  description = "AWS CLI named profile. Leave empty to use env-var credentials (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY) or the default credential chain."
+  type        = string
+  default     = ""
+}
+
 variable "ecr_repo_name" {
   description = "ECR repository name"
   type        = string

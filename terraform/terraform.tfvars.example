@@ -1,0 +1,28 @@
+# Copy to terraform.tfvars and fill in your values.
+# terraform.tfvars is gitignored — never commit credentials.
+
+# ── Required ──────────────────────────────────────────────────────────────────
+
+# Your GitHub repo in owner/name format.
+# The OIDC trust policy is scoped to this repo — GitHub Actions can assume
+# the IAM role only from workflows running in this repo.
+github_repo = "your-github-username/your-repo-name"
+
+# ── AWS credentials (choose one approach) ─────────────────────────────────────
+
+# Option A — named profile from ~/.aws/config
+aws_profile = "my-aws-profile"
+
+# Option B — leave aws_profile empty and export env vars before running:
+#   export AWS_ACCESS_KEY_ID=...
+#   export AWS_SECRET_ACCESS_KEY=...
+#   export AWS_SESSION_TOKEN=...   # if using temporary credentials
+# aws_profile = ""
+
+# ── Optional overrides (defaults shown) ───────────────────────────────────────
+
+# aws_region             = "us-east-1"
+# ecr_repo_name          = "sample-nodejs"
+# eks_cluster_name       = "refael"
+# eks_node_instance_type = "t3.medium"
+# eks_desired_nodes      = 2

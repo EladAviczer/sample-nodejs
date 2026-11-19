@@ -84,18 +84,25 @@ tasks:
       - terraform -chdir=terraform destroy
 
   # ── AWS helpers ──────────────────────────────────────────────────────────────
+  # Set AWS_PROFILE env var (or export AWS_ACCESS_KEY_ID/SECRET) before running.
   "aws:kubeconfig":
-    desc: Configure kubectl for the EKS cluster
+    desc: Configure kubectl for the EKS cluster (reads region/name from terraform outputs)
     cmds:
-      - aws eks update-kubeconfig --region us-east-1 --name refael --profile assignment-tests
+      - |
+        REGION=$(terraform -chdir=terraform output -raw aws_region)
+        CLUSTER=$(terraform -chdir=terraform output -raw eks_cluster_name)
+        aws eks update-kubeconfig --region "$REGION" --name "$CLUSTER" \
+          ${AWS_PROFILE:+--profile "$AWS_PROFILE"}
 
   "aws:ecr-login":
-    desc: Authenticate Docker to ECR
+    desc: Authenticate Docker to ECR (reads registry from terraform output)
     cmds:
-      - >
-        aws ecr get-login-password --region us-east-1 --profile assignment-tests |
-        docker login --username AWS --password-stdin
-        $(terraform -chdir=terraform output -raw ecr_repository_url | cut -d/ -f1)
+      - |
+        REGION=$(terraform -chdir=terraform output -raw aws_region)
+        REGISTRY=$(terraform -chdir=terraform output -raw ecr_repository_url | cut -d/ -f1)
+        aws ecr get-login-password --region "$REGION" \
+          ${AWS_PROFILE:+--profile "$AWS_PROFILE"} |
+          docker login --username AWS --password-stdin "$REGISTRY"
 
   # ── ArgoCD ───────────────────────────────────────────────────────────────────
   "argocd:install":

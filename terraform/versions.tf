@@ -14,6 +14,8 @@ terraform {
 }
 
 provider "aws" {
-  profile = "assignment-tests"
   region  = var.aws_region
+  # profile is optional — set via var.aws_profile, AWS_PROFILE env var,
+  # or leave empty to use the standard credential chain (env keys, IAM role, etc.)
+  profile = var.aws_profile != "" ? var.aws_profile : null
 }
