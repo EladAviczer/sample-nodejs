@@ -1,0 +1,4 @@
+ignore:
+  # Alpine packages are versioned via the base image tag (node:22-alpine),
+  # not per-package pinning — DL3018 doesn't apply here.
+  - DL3018
