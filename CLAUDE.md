@@ -1,5 +1,45 @@
 # CLAUDE.md — Refael Home Assignment
 
+## Session Start Protocol (ALWAYS RUN FIRST)
+
+**Every session on this repo must start with these steps — no exceptions:**
+
+### Step 1: Load mission context
+```bash
+gh issue view 14 --repo OrenOren1/refael --comments
+```
+
+### Step 2: Check actual file state
+```bash
+ls .github/workflows/ci.yml 2>/dev/null && echo "✅ ci.yml" || echo "❌ ci.yml missing"
+ls terraform/main.tf 2>/dev/null && echo "✅ terraform" || echo "❌ terraform missing"
+ls Taskfile.yml 2>/dev/null && echo "✅ Taskfile" || echo "❌ Taskfile missing"
+ls argocd/application.yaml 2>/dev/null && echo "✅ argocd" || echo "❌ argocd missing"
+```
+
+### Step 3: Tell the user
+After reading the logbook and checking files, present to the user:
+- What is already done (confirmed by file check)
+- What is the **single next recommended step** (first item from the logbook's pending list)
+- Ask: "Want me to start on [next step]?"
+
+### Step 4: End of session
+Before ending any session where files were created or changed:
+```bash
+gh issue comment 14 --repo OrenOren1/refael --body "## Session $(date +%Y-%m-%d)
+
+**Done this session:**
+- [list what was written/changed]
+
+**Current state:**
+- [list what is now done]
+
+**Next step:**
+- [first pending item]"
+```
+
+---
+
 ## Home Assignment Context
 
 This repo is a DevOps/DevSecOps home assignment. Full brief:
