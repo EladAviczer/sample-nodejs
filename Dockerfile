@@ -4,7 +4,8 @@ COPY package*.json ./
 RUN npm ci --only=production
 
 FROM node:22-alpine AS runtime
-RUN apk add --no-cache dumb-init \
+RUN apk upgrade --no-cache \
+    && apk add --no-cache dumb-init \
     && npm install -g npm@latest \
     && npm cache clean --force
 WORKDIR /app
