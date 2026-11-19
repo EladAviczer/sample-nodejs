@@ -57,31 +57,35 @@ refael/
 
 ## Pipeline
 
-Three triggers, three behaviours:
+One router workflow: the `detect` job classifies the branch (verify vs `v*` release) and the changed paths, then every downstream job is gated on those outputs. There are no trigger-level `paths` filters — routing is decided inside the run.
 
-| Trigger | Jobs | What it does |
+| Trigger | Changed paths | Jobs |
 |---|---|---|
-| Pull Request | `sast` + `lint` + `build-and-scan` (parallel) | Gate: fail fast before merge |
-| Push to `main` | Same 3 parallel jobs | Verify merged state |
-| Push `v*` tag | `build-scan-push` → `update-image-tag` | Build, scan, push ECR, open deploy PR |
+| PR / push `main` | app.js, package*.json, Dockerfile | `sast` + `lint` + `build-and-scan` (parallel) |
+| PR / push `main` | helm/ | `lint-helm` |
+| PR / push `main` | terraform/ | `check-terraform` |
+| PR / push `main` | argocd/ | `validate-argocd` |
+| Push `v*` tag | app code since previous tag | `build-scan-push` → `update-image-tag` |
 
-### PR Gate (3 parallel jobs, no `needs` between them)
+### Verify jobs (PR / main push, only for affected paths)
 
-```
-sast ──────────────────────────────────────────┐
-lint ──────────────────────────────────────────┤─── all must pass to merge
-build-and-scan (build → trivy scan, no push) ──┘
-```
-
-**SAST** (`sast` job):
+**SAST** (`sast` — app changes):
 - `npm audit --audit-level=high` — SCA, blocks on any HIGH+
 - `njsscan` — Node.js-specific SAST, blocks on any finding
 
-**Lint** (`lint` job):
+**Lint** (`lint` — app changes):
 - `hadolint` — Dockerfile best-practice linter
-- `helm lint --strict` — Helm chart validation
 
-**Build & Scan** (`build-and-scan` job):
+**Helm lint** (`lint-helm` — helm/ changes):
+- `helm lint helm/ --strict`
+
+**Terraform** (`check-terraform` — terraform/ changes):
+- `terraform fmt -check` + `init -backend=false` + `validate` + `plan` (OIDC via `AWS_ROLE_TO_ASSUME`)
+
+**ArgoCD** (`validate-argocd` — argocd/ changes):
+- YAML parse + `apiVersion` / `kind` presence check
+
+**Build & Scan** (`build-and-scan` — app changes):
 - `docker build --load` — build image into local daemon
 - Trivy scan: `severity: HIGH,CRITICAL`, `ignore-unfixed: true`, SARIF output to GitHub Security tab
 

@@ -5,20 +5,8 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
-    paths:
-      - "app.js"
-      - "package*.json"
-      - "Dockerfile"
-      - "helm/**"
-      - ".github/workflows/**"
   pull_request:
     branches: [main]
-    paths:
-      - "app.js"
-      - "package*.json"
-      - "Dockerfile"
-      - "helm/**"
-      - ".github/workflows/**"
 
 # Cancel in-flight runs for the same ref on new pushes (PRs only — never cancel a release)
 concurrency:
@@ -33,14 +21,76 @@ env:
   AWS_REGION: us-east-1
   ECR_REPOSITORY: sample-nodejs
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PR / main push: 3 fully parallel jobs (no `needs` between them)
-# ─────────────────────────────────────────────────────────────────────────────
-
 jobs:
+  detect:
+    name: Route by branch + changed paths
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      app: ${{ steps.routes.outputs.app }}
+      helm: ${{ steps.routes.outputs.helm }}
+      terraform: ${{ steps.routes.outputs.terraform }}
+      argocd: ${{ steps.routes.outputs.argocd }}
+      verify: ${{ steps.routes.outputs.verify }}
+      release: ${{ steps.routes.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Classify branch and changed paths
+        id: routes
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GIT_REF: ${{ github.ref }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$GIT_REF" == refs/tags/v* ]]; then
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            echo "verify=false" >> "$GITHUB_OUTPUT"
+            PREV=$(git tag --sort=-version:refname | grep -E '^v[0-9]' | sed -n '2p' || true)
+            RANGE="${PREV:+${PREV}..HEAD}"
+          else
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            echo "verify=true" >> "$GITHUB_OUTPUT"
+            if [[ "$EVENT_NAME" == "pull_request" ]]; then
+              git fetch origin "$BASE_REF" --no-tags
+              RANGE="origin/${BASE_REF}...HEAD"
+            elif git rev-parse --verify HEAD^ >/dev/null 2>&1; then
+              RANGE="HEAD^..HEAD"
+            else
+              RANGE=""
+            fi
+          fi
+
+          if [[ -n "$RANGE" ]]; then
+            CHANGED=$(git diff --name-only "$RANGE")
+          else
+            CHANGED=$(git ls-files)
+          fi
+
+          printf 'Changed files:\n%s\n' "$CHANGED"
+
+          check() {
+            if printf '%s\n' "$CHANGED" | grep -qE "$1"; then
+              echo "$2=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "$2=false" >> "$GITHUB_OUTPUT"
+            fi
+          }
+
+          check '^(app\.js|package(-lock)?\.json|Dockerfile)$' app
+          check '^helm/' helm
+          check '^terraform/' terraform
+          check '^argocd/' argocd
+
   sast:
     name: SAST
-    if: "!startsWith(github.ref, 'refs/tags/')"
+    needs: detect
+    if: needs.detect.outputs.verify == 'true' && needs.detect.outputs.app == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -64,7 +114,8 @@ jobs:
 
   lint:
     name: Lint
-    if: "!startsWith(github.ref, 'refs/tags/')"
+    needs: detect
+    if: needs.detect.outputs.verify == 'true' && needs.detect.outputs.app == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -76,12 +127,83 @@ jobs:
           dockerfile: Dockerfile
           ignore: DL3018
 
+  lint-helm:
+    name: Helm lint
+    needs: detect
+    if: needs.detect.outputs.verify == 'true' && needs.detect.outputs.helm == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
       - name: Helm lint
         run: helm lint helm/ --strict
 
+  check-terraform:
+    name: Terraform fmt + validate + plan
+    needs: detect
+    if: needs.detect.outputs.verify == 'true' && needs.detect.outputs.terraform == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      id-token: write  # OIDC → AWS for plan
+      contents: read
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+
+      - name: terraform fmt -check
+        run: terraform fmt -check -recursive
+
+      - name: terraform init
+        run: terraform init -backend=false -input=false
+
+      - name: terraform validate
+        run: terraform validate
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: terraform plan
+        run: terraform plan -input=false -no-color
+
+  validate-argocd:
+    name: Validate ArgoCD manifest
+    needs: detect
+    if: needs.detect.outputs.verify == 'true' && needs.detect.outputs.argocd == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq \
+            https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Validate manifest structure
+        run: |
+          for f in argocd/*.yaml argocd/*.yml; do
+            [ -e "$f" ] || continue
+            yq e '.' "$f" > /dev/null
+            test -n "$(yq e '.apiVersion // ""' "$f")"
+            test -n "$(yq e '.kind // ""' "$f")"
+          done
+
   build-and-scan:
     name: Build & Trivy Scan
-    if: "!startsWith(github.ref, 'refs/tags/')"
+    needs: detect
+    if: needs.detect.outputs.verify == 'true' && needs.detect.outputs.app == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -111,43 +233,10 @@ jobs:
           name: trivy-sarif
           path: trivy.sarif
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Release (git tag v*): minimal sequential chain — sast/lint already ran on PR
-# ─────────────────────────────────────────────────────────────────────────────
-
-  gate-code-change:
-    name: Gate — app code changed?
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    outputs:
-      changed: ${{ steps.check.outputs.changed }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # need full history to find previous tag
-
-      - name: Detect app-code change since last tag
-        id: check
-        run: |
-          PREV_TAG=$(git tag --sort=-version:refname | grep -E '^v[0-9]' | sed -n '2p')
-          if [ -z "$PREV_TAG" ]; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          else
-            DIFF=$(git diff --name-only "$PREV_TAG" HEAD -- app.js 'package*.json' Dockerfile)
-            if [ -n "$DIFF" ]; then
-              echo "changed=true" >> "$GITHUB_OUTPUT"
-            else
-              echo "changed=false" >> "$GITHUB_OUTPUT"
-              echo "No app-code changes since $PREV_TAG — skipping release."
-            fi
-          fi
-
   build-scan-push:
     name: Build / Scan / Push
-    needs: gate-code-change
-    if: >
-      startsWith(github.ref, 'refs/tags/v') &&
-      needs.gate-code-change.outputs.changed == 'true'
+    needs: detect
+    if: needs.detect.outputs.release == 'true' && needs.detect.outputs.app == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -204,10 +293,8 @@ jobs:
 
   update-image-tag:
     name: Open Deploy PR
-    needs: [gate-code-change, build-scan-push]
-    if: >
-      startsWith(github.ref, 'refs/tags/v') &&
-      needs.gate-code-change.outputs.changed == 'true'
+    needs: [detect, build-scan-push]
+    if: needs.detect.outputs.release == 'true' && needs.detect.outputs.app == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

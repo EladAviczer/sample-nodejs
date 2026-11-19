@@ -95,6 +95,57 @@ resource "aws_iam_role_policy" "ecr_push" {
   policy = data.aws_iam_policy_document.ecr_push.json
 }
 
+# ── Terraform plan (PR gate) ──────────────────────────────────────────────────
+
+data "aws_iam_policy_document" "plan_read" {
+  statement {
+    sid    = "ReadResources"
+    effect = "Allow"
+    actions = [
+      "ec2:DescribeVpcs",
+      "ec2:DescribeSubnets",
+      "ec2:DescribeAvailabilityZones",
+      "ecr:DescribeRepositories",
+      "ecr:GetLifecyclePolicy",
+      "eks:ListClusters",
+      "eks:DescribeCluster",
+      "eks:ListNodegroups",
+      "eks:DescribeNodegroup",
+      "sts:GetCallerIdentity",
+    ]
+    resources = ["*"]
+  }
+
+  statement {
+    sid    = "ReadIam"
+    effect = "Allow"
+    actions = [
+      "iam:GetRole",
+      "iam:GetRolePolicy",
+      "iam:ListRolePolicies",
+      "iam:ListAttachedRolePolicies",
+    ]
+    resources = [
+      aws_iam_role.github_actions.arn,
+      aws_iam_role.eks_cluster.arn,
+      aws_iam_role.eks_node.arn,
+    ]
+  }
+
+  statement {
+    sid       = "ReadOidcProvider"
+    effect    = "Allow"
+    actions   = ["iam:GetOpenIDConnectProvider"]
+    resources = [aws_iam_openid_connect_provider.github.arn]
+  }
+}
+
+resource "aws_iam_role_policy" "plan_read" {
+  name   = "plan-read"
+  role   = aws_iam_role.github_actions.id
+  policy = data.aws_iam_policy_document.plan_read.json
+}
+
 # ── Networking (default VPC) ──────────────────────────────────────────────────
 
 data "aws_vpc" "default" {
