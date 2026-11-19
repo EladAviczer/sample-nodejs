@@ -93,6 +93,41 @@ This repo is a DevOps/DevSecOps home assignment. Full brief:
 - AWS_PROFILE: `assignment-tests`
 - Region: `us-east-1`
 
+## Git Workflow Rules (ALWAYS FOLLOW)
+
+**Every feature or fix goes in its own PR — never commit directly to `main`.**
+
+### Branch naming → semantic version bump
+
+| Branch prefix | Semver bump | Example |
+|---|---|---|
+| `feat/` | minor | `feat/add-terraform` → v1.1.0 |
+| `fix/` | patch | `fix/trivy-cve` → v1.0.1 |
+| `chore/` | patch | `chore/update-deps` → v1.0.1 |
+| `refactor/` | patch | `refactor/ci-dag` → v1.0.1 |
+| `docs/` | none | no tag |
+
+### PR workflow
+
+1. **Create branch** from `main` with the correct prefix:
+   ```bash
+   git checkout -b feat/<slug>   # or fix/ chore/ refactor/ docs/
+   ```
+2. **Commit** using conventional-commit format (`feat:`, `fix:`, `chore:`, etc.)
+3. **Open PR** targeting `main`:
+   ```bash
+   gh pr create --base main --title "<type>: <short description>" --body "..."
+   ```
+4. **After merge** — tag `main` with the next semver derived from the branch prefix:
+   ```bash
+   git tag v<MAJOR>.<MINOR>.<PATCH>
+   git push origin v<MAJOR>.<MINOR>.<PATCH>
+   ```
+
+> No exceptions: even a one-line fix gets its own branch + PR before merging.
+
+---
+
 ## Mission Logbook
 
 **Always read this first** to restore session context:
