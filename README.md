@@ -33,6 +33,64 @@ Port: `8080` (override with `PORT` env var)
 
 ---
 
+## Live on EKS
+
+App is deployed and reachable via nginx-ingress + AWS Classic ELB:
+
+```
+http://a15ebd35af7e94bdca165ccf4a99414d-23966090.us-east-1.elb.amazonaws.com
+```
+
+| Endpoint | Expected response | Screenshot |
+|---|---|---|
+| `/my-app` | `Hello, World!` | ![my-app](docs/screenshots/app-my-app.jpg) |
+| `/ready` | `Ready` | ![ready](docs/screenshots/app-ready.jpg) |
+| `/live` | `Alive` | ![live](docs/screenshots/app-live.jpg) |
+
+ArgoCD sync + pod state at time of capture:
+
+```
+NAME            SYNC STATUS   HEALTH STATUS
+sample-nodejs   Synced        Healthy
+
+NAME                             READY   STATUS
+sample-nodejs-6d7457ffb6-r9fm5   1/1     Running
+sample-nodejs-6d7457ffb6-zm7d2   1/1     Running
+```
+
+---
+
+## Ingress: Why nginx-ingress, not AWS Load Balancer Controller
+
+The assignment brief requires a Kubernetes `Ingress` resource with a reachable endpoint and screenshots. It does not mandate a specific ingress controller or HTTPS. Here is why I chose **nginx-ingress** for the demo, and what a full production setup would add.
+
+### nginx-ingress (this demo)
+
+| Factor | Detail |
+|---|---|
+| **Simplicity** | One `helm install` — no AWS-specific prerequisites |
+| **No IRSA needed** | AWS Load Balancer Controller requires a dedicated IAM Role for Service Accounts (IRSA) with an OIDC provider wired to the cluster |
+| **No ACM cert** | nginx-ingress terminates HTTP at the ELB — no TLS cert to provision or attach |
+| **Classic ELB auto-provisioned** | Kubernetes provisions an AWS Classic Load Balancer automatically when `service.type: LoadBalancer` is detected |
+| **Environment parity** | Same nginx controller runs on k3d (local) and EKS (prod) — zero divergence (ADR-009) |
+
+### AWS Load Balancer Controller (production path — ADR-016)
+
+The AWS Load Balancer Controller is the right choice when you need:
+- **HTTPS with ACM cert** — ALB natively terminates TLS using an ACM-managed certificate
+- **ALB-native features** — WAF integration, weighted target groups, path-based routing at the ALB layer
+- **Cost** — ALB is cheaper per GB than Classic ELB for high-traffic workloads
+
+It requires setup that is out of scope for a demo:
+1. OIDC provider associated with the EKS cluster
+2. IRSA: IAM role with `elasticloadbalancing:*` + `ec2:Describe*` permissions, annotated on the controller's ServiceAccount
+3. ACM certificate for the target domain (e.g. `*.example.com`)
+4. Ingress annotation: `kubernetes.io/ingress.class: alb` + `alb.ingress.kubernetes.io/certificate-arn`
+
+This path is documented in [ADR-016](/.adlc/drafts/adr/ADR-016.md). The Helm chart already supports it via `ingress.className: alb` and `ingress.tls.certArn` in `values.yaml`.
+
+---
+
 ## Repo Map
 
 ```
@@ -227,6 +285,7 @@ Every non-obvious choice is documented. Here's the full set:
 | [ADR-011](/.adlc/drafts/adr/ADR-011.md) | Terraform for AWS infra | Reproducible, reviewable, idempotent — no click-ops |
 | [ADR-012](/.adlc/drafts/adr/ADR-012.md) | Hadolint + helm lint in CI | Catch Dockerfile and chart issues before they reach image build |
 | [ADR-013](/.adlc/drafts/adr/ADR-013.md) | Taskfile as local task runner | Single YAML, Go binary, mirrors CI step order exactly |
+| [ADR-016](/.adlc/drafts/adr/ADR-016.md) | nginx-ingress (demo) → ALB (prod path) | nginx-ingress needs no IRSA/ACM; ALB path documented for HTTPS + custom domain |
 
 ---
 
