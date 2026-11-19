@@ -62,6 +62,54 @@ tasks:
           --set image.tag="{{.LOCAL_TAG}}"
           --set image.pullPolicy=Never
 
+  # ── Terraform (AWS env) ──────────────────────────────────────────────────────
+  "tf:init":
+    desc: Terraform init
+    cmds:
+      - terraform -chdir=terraform init
+
+  "tf:plan":
+    desc: Terraform plan (review before apply)
+    cmds:
+      - terraform -chdir=terraform plan
+
+  "tf:apply":
+    desc: Provision AWS resources — ECR, OIDC IAM role, EKS cluster
+    cmds:
+      - terraform -chdir=terraform apply -auto-approve
+
+  "tf:destroy":
+    desc: Destroy all Terraform-managed AWS resources
+    cmds:
+      - terraform -chdir=terraform destroy
+
+  # ── AWS helpers ──────────────────────────────────────────────────────────────
+  "aws:kubeconfig":
+    desc: Configure kubectl for the EKS cluster
+    cmds:
+      - aws eks update-kubeconfig --region us-east-1 --name refael --profile assignment-tests
+
+  "aws:ecr-login":
+    desc: Authenticate Docker to ECR
+    cmds:
+      - >
+        aws ecr get-login-password --region us-east-1 --profile assignment-tests |
+        docker login --username AWS --password-stdin
+        $(terraform -chdir=terraform output -raw ecr_repository_url | cut -d/ -f1)
+
+  # ── ArgoCD ───────────────────────────────────────────────────────────────────
+  "argocd:install":
+    desc: Install ArgoCD on the cluster
+    cmds:
+      - kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+      - kubectl wait --for=condition=available --timeout=180s deployment/argocd-server -n argocd
+
+  "argocd:apply":
+    desc: Register the app with ArgoCD (creates Application CR)
+    cmds:
+      - kubectl apply -f argocd/application.yaml
+
   # ── Full local CI ─────────────────────────────────────────────────────────────
   ci:
     desc: Run full local CI pipeline (lint → security → build → scan → deploy:local)
