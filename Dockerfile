@@ -6,8 +6,10 @@ RUN npm ci --only=production
 FROM node:22-alpine AS runtime
 RUN apk upgrade --no-cache \
     && apk add --no-cache dumb-init \
-    && npm install -g npm@latest \
-    && npm cache clean --force
+    && rm -rf /usr/local/lib/node_modules/npm \
+              /usr/local/bin/npm \
+              /usr/local/bin/npx \
+              /root/.npm
 WORKDIR /app
 ENV NODE_ENV=production
 COPY --from=deps /app/node_modules ./node_modules
