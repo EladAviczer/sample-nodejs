@@ -99,13 +99,17 @@ This repo is a DevOps/DevSecOps home assignment. Full brief:
 
 ### Branch naming → semantic version bump
 
-| Branch prefix | Semver bump | Example |
-|---|---|---|
-| `feat/` | minor | `feat/add-terraform` → v1.1.0 |
-| `fix/` | patch | `fix/trivy-cve` → v1.0.1 |
-| `chore/` | patch | `chore/update-deps` → v1.0.1 |
-| `refactor/` | patch | `refactor/ci-dag` → v1.0.1 |
-| `docs/` | none | no tag |
+**Only tag after merging PRs that change app code** (`app.js`, `Dockerfile`, `package*.json`).
+Infrastructure, CI config, Helm, Terraform, and docs changes do **not** get a tag — the release gate in CI will skip them anyway.
+
+| Branch prefix | Semver bump | Tag? | Example |
+|---|---|---|---|
+| `feat/` | minor | only if app code changed | `feat/new-endpoint` → v1.1.0 |
+| `fix/` | patch | only if app code changed | `fix/auth-bug` → v1.0.1 |
+| `chore/` | patch | only if app code changed | `chore/update-deps` → v1.0.1 |
+| `refactor/` | patch | only if app code changed | `refactor/handler` → v1.0.1 |
+| `docs/` | none | never | — |
+| `feat/terraform-*`, `fix/ci-*`, etc. | — | never | infra/CI-only changes — no tag |
 
 ### PR workflow
 
