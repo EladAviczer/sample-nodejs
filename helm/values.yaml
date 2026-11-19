@@ -10,7 +10,7 @@ service:
 ingress:
   enabled: true
   className: nginx
-  host: "app.example.com" # override with your domain
+  host: "a15ebd35af7e94bdca165ccf4a99414d-23966090.us-east-1.elb.amazonaws.com"
   tls:
     enabled: false # set true + provide cert-arn annotation for prod
     certArn: "" # ACM cert ARN (aws alb.ingress.kubernetes.io/certificate-arn)
