@@ -168,12 +168,14 @@ jobs:
         run: terraform validate
 
       - name: Configure AWS credentials (OIDC)
+        if: github.event_name == 'pull_request'
         uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: terraform plan
+        if: github.event_name == 'pull_request'
         run: terraform plan -input=false -no-color
 
   validate-argocd:
