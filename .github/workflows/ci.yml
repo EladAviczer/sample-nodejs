@@ -4,8 +4,20 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
+    paths:
+      - "app.js"
+      - "package*.json"
+      - "Dockerfile"
+      - "helm/**"
+      - ".github/workflows/**"
   pull_request:
     branches: [main]
+    paths:
+      - "app.js"
+      - "package*.json"
+      - "Dockerfile"
+      - "helm/**"
+      - ".github/workflows/**"
 
 # Cancel in-flight runs for the same ref on new pushes (PRs only — never cancel a release)
 concurrency:
@@ -101,9 +113,39 @@ jobs:
 # Release (git tag v*): minimal sequential chain — sast/lint already ran on PR
 # ─────────────────────────────────────────────────────────────────────────────
 
+  gate-code-change:
+    name: Gate — app code changed?
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.check.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # need full history to find previous tag
+
+      - name: Detect app-code change since last tag
+        id: check
+        run: |
+          PREV_TAG=$(git tag --sort=-version:refname | grep -E '^v[0-9]' | sed -n '2p')
+          if [ -z "$PREV_TAG" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            DIFF=$(git diff --name-only "$PREV_TAG" HEAD -- app.js 'package*.json' Dockerfile)
+            if [ -n "$DIFF" ]; then
+              echo "changed=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              echo "No app-code changes since $PREV_TAG — skipping release."
+            fi
+          fi
+
   build-scan-push:
     name: Build / Scan / Push
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: gate-code-change
+    if: >
+      startsWith(github.ref, 'refs/tags/v') &&
+      needs.gate-code-change.outputs.changed == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -160,8 +202,10 @@ jobs:
 
   update-image-tag:
     name: Open Deploy PR
-    needs: build-scan-push
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [gate-code-change, build-scan-push]
+    if: >
+      startsWith(github.ref, 'refs/tags/v') &&
+      needs.gate-code-change.outputs.changed == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
