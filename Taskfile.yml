@@ -1,0 +1,73 @@
+version: "3"
+
+vars:
+  APP: sample-nodejs
+  LOCAL_TAG: local
+  NAMESPACE: refael
+  K3D_CLUSTER: refael
+
+tasks:
+  # ── Linting ─────────────────────────────────────────────────────────────────
+  lint:
+    desc: Lint Dockerfile and Helm chart
+    cmds:
+      - hadolint Dockerfile
+      - helm lint helm/ --strict
+
+  # ── Security / SAST ─────────────────────────────────────────────────────────
+  security:
+    desc: Run npm audit (SCA) and nodejsscan (SAST)
+    cmds:
+      - npm audit --audit-level=high
+      - nodejsscan -d . -o json
+
+  # ── Docker ──────────────────────────────────────────────────────────────────
+  build:
+    desc: Build Docker image (local daemon)
+    cmds:
+      - docker build --load -t "{{.APP}}:{{.LOCAL_TAG}}" .
+
+  scan:
+    desc: Trivy scan local image (gate on HIGH+)
+    deps: [build]
+    cmds:
+      - trivy image --severity HIGH,CRITICAL --ignore-unfixed "{{.APP}}:{{.LOCAL_TAG}}"
+
+  # ── k3d cluster lifecycle ────────────────────────────────────────────────────
+  "k3d:up":
+    desc: Create local k3d cluster with nginx-ingress
+    cmds:
+      - k3d cluster create "{{.K3D_CLUSTER}}" --agents 1 -p "8080:80@loadbalancer"
+      - kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.11.3/deploy/static/provider/cloud/deploy.yaml
+      - kubectl wait --namespace ingress-nginx --for=condition=ready pod --selector=app.kubernetes.io/component=controller --timeout=120s
+
+  "k3d:down":
+    desc: Delete local k3d cluster
+    cmds:
+      - k3d cluster delete "{{.K3D_CLUSTER}}"
+
+  "k3d:status":
+    desc: Show pods in cluster namespace
+    cmds:
+      - kubectl get pods -n "{{.NAMESPACE}}"
+
+  # ── Helm deploy (local) ──────────────────────────────────────────────────────
+  "deploy:local":
+    desc: Deploy to local k3d cluster
+    deps: [build]
+    cmds:
+      - k3d image import "{{.APP}}:{{.LOCAL_TAG}}" -c "{{.K3D_CLUSTER}}"
+      - helm upgrade --install "{{.APP}}" helm/ -n "{{.NAMESPACE}}" --create-namespace
+          --set image.repository="{{.APP}}"
+          --set image.tag="{{.LOCAL_TAG}}"
+          --set image.pullPolicy=Never
+
+  # ── Full local CI ─────────────────────────────────────────────────────────────
+  ci:
+    desc: Run full local CI pipeline (lint → security → build → scan → deploy:local)
+    cmds:
+      - task: lint
+      - task: security
+      - task: build
+      - task: scan
+      - task: deploy:local

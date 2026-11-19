@@ -1,0 +1,61 @@
+replicaCount: 2
+
+image:
+  repository: ""  # set to ECR URI by terraform output / CI
+  tag: "1.0.0"
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+
+ingress:
+  enabled: true
+  className: nginx
+  host: "app.example.com"  # override with your domain
+  tls:
+    enabled: false          # set true + provide cert-arn annotation for prod
+    certArn: ""             # ACM cert ARN (aws alb.ingress.kubernetes.io/certificate-arn)
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 250m
+    memory: 256Mi
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 70
+
+config:
+  port: "8080"
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+probes:
+  readiness:
+    path: /ready
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    failureThreshold: 3
+  liveness:
+    path: /live
+    initialDelaySeconds: 15
+    periodSeconds: 20
+    failureThreshold: 3
