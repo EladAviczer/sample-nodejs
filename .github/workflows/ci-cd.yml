@@ -75,7 +75,7 @@ jobs:
           tags: sample-nodejs:ci
 
       - name: Scan image with Trivy
-        uses: aquasecurity/trivy-action@0.33.1
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: sample-nodejs:ci
           format: table
