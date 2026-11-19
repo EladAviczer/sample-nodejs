@@ -1,1 +1,35 @@
 node_modules/
+
+# ADLC allowlist
+.adlc/*
+.adlc/evals/results/
+.adlc/memory/*
+.adlc/team-learn-report.md
+.adlc/team-levelup-report.md
+graphify-out/
+!.adlc/init-options.json
+!.adlc/workspace.yml
+!.adlc/drafts/
+!.adlc/evals/
+!.adlc/memory/
+!.adlc/memory/evals/
+!.adlc/memory/evals/holdout.json
+
+# Agent install surface
+.agents/
+.opencode/
+.claude/
+.cursor/
+.codex/
+.gemini/
+.qwen/
+.devin/
+.tabnine/
+skills-lock.json
+.skills.json
+.events.json
+.pytest_cache/
+.ruff_cache/
+
+# team-ai-directives (external repo — not committed here)
+team-ai-directives/
