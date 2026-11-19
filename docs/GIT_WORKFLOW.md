@@ -87,4 +87,4 @@ gh run list --workflow CI --event push                   # tag-triggered release
 gh pr list --search "chore: deploy image" --state all    # generated deploy PRs
 ```
 
-Related reading: [ADR-003](adlc/memory/adr/ADR-003.md), [ADR-005](adlc/memory/adr/ADR-005.md), [ADR-008](adlc/memory/adr/ADR-008.md), [ADR-010](adlc/memory/adr/ADR-010.md), and the README's Pipeline / GitOps Flow sections.
+Related reading: [ADR-003](https://github.com/OrenOren1/refael/issues/3), [ADR-005](https://github.com/OrenOren1/refael/issues/6), [ADR-008](https://github.com/OrenOren1/refael/issues/10), [ADR-010](https://github.com/OrenOren1/refael/issues/8), and the README's Pipeline / GitOps Flow sections.
