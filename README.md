@@ -132,6 +132,8 @@ Merge PR → ArgoCD detects helm/ change → auto-sync → EKS
 
 ArgoCD Application (`argocd/application.yaml`) watches `helm/` on `main`, prunes removed resources, self-heals on drift, retries up to 3×.
 
+For the full branch/PR rules, SemVer tag policy, and the reviewer checklist, see [Git Workflow & Version Bumping](docs/GIT_WORKFLOW.md).
+
 ---
 
 ## Infrastructure
@@ -252,6 +254,7 @@ What to look at:
 4. **[`argocd/application.yaml`](./argocd/application.yaml)** — auto-sync, prune, self-heal, retry policy.
 5. **[`terraform/main.tf`](./terraform/main.tf)** — ECR + OIDC + EKS in one file. Subnets filtered for EKS-compatible AZs.
 6. **[`Taskfile.yml`](./Taskfile.yml)** — local CI parity. `task ci` runs the same chain as the pipeline.
+7. **[`docs/GIT_WORKFLOW.md`](docs/GIT_WORKFLOW.md)** — branch/PR flow, SemVer tag policy, and how `v*` tags map to ECR push, deploy PR, and ArgoCD sync.
 
 Things intentionally left out:
 - **No `.trivyignore`** — CVEs are fixed at the root, not suppressed
