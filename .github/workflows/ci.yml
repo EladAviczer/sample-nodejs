@@ -49,14 +49,21 @@ jobs:
         with:
           args: "."
 
-  helm-lint:
-    name: Helm Lint
+  lint:
+    name: Lint
     if: "!startsWith(github.ref, 'refs/tags/')"
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - run: helm lint helm/ --strict
+
+      - name: Hadolint — Dockerfile linter
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+
+      - name: Helm lint
+        run: helm lint helm/ --strict
 
   build-and-scan:
     name: Build & Trivy Scan
