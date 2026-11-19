@@ -1,0 +1,8 @@
+{
+  "projectName": "home assignments",
+  "env": {
+    "AWS_PROFILE": "assignment-tests",
+    "AWS_REGION": "us-east-1",
+    "AWS_DEFAULT_REGION": "us-east-1"
+  }
+}
