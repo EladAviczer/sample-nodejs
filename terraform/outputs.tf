@@ -16,7 +16,12 @@ output "eks_cluster_endpoint" {
   value = aws_eks_cluster.main.endpoint
 }
 
+output "aws_region" {
+  description = "AWS region used for this deployment"
+  value       = var.aws_region
+}
+
 output "configure_kubectl" {
-  description = "Run this after apply to configure kubectl"
-  value       = "aws eks update-kubeconfig --region ${var.aws_region} --name ${var.eks_cluster_name} --profile assignment-tests"
+  description = "Run this after apply to configure kubectl (set AWS_PROFILE first if using a named profile)"
+  value       = "aws eks update-kubeconfig --region ${var.aws_region} --name ${var.eks_cluster_name}"
 }
