@@ -10,6 +10,16 @@ Fork a sample Node.js/Express app. Ship it with a fully automated CI/CD pipeline
 
 ---
 
+## My Approach: ADRs to Deployment and CI
+
+I approached this mission decision-first: before writing pipeline YAML, Helm charts, or Terraform, I captured the key trade-offs as ADRs (ADR-001–ADR-013) so each implementation choice had explicit drivers, alternatives, and consequences. Starting from the app itself, I kept it as a stateless Express monolith (ADR-001) with in-process Prometheus metrics (ADR-002), which made Kubernetes `Deployment`, probes, and rolling updates straightforward.
+
+For CI/CD, I chose GitHub Actions (ADR-003) with a single workflow that routes by branch and changed paths: a `detect` job classifies verify vs `v*` release runs and fans out only the relevant gates (SAST/SCA with `njsscan` + `npm audit`, Hadolint/Helm lint, Terraform fmt/validate/plan, ArgoCD manifest validation). On app changes I build locally, scan with Trivy (HIGH/CRITICAL, ignore-unfixed) before any registry push, and only on a release tag push the image to ECR using keyless AWS OIDC auth (ADR-004, ADR-006, ADR-007, ADR-011). Releases follow semver tags (ADR-010): after a successful build/scan/push, CI opens a PR that updates `helm/values.yaml` rather than pushing to `main` directly (ADR-008), keeping every deployment reviewable and auditable.
+
+For deployment, I used same-repo GitOps with ArgoCD watching `helm/` (ADR-005) so a merged deploy PR triggers auto-sync to the cluster. The Helm chart carries the production concerns—probes, resource limits, security context, HPA/PDB options—and is kept environment-agnostic so the same manifests run on EKS for production and k3d for local development (ADR-009). I provisioned AWS foundations (ECR, GitHub OIDC/IAM, EKS-related resources) with Terraform (ADR-011) and mirrored the pipeline locally with a Taskfile (ADR-013) so `task ci` gives fast feedback before pushing. The rest of this README documents the resulting system and how to run it.
+
+---
+
 ## What's Running
 
 ```
