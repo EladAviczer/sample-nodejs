@@ -8,18 +8,22 @@ COPY package*.json ./
 RUN npm ci --omit=dev
 
 
-# Stage 2: Minimal production runtime
-FROM gcr.io/distroless/nodejs22-debian13:nonroot
+# Stage 2: Minimal runtime without npm
+FROM alpine:3.22
+
+RUN apk add --no-cache nodejs
 
 ENV NODE_ENV=production
+ENV PORT=8080
 
 WORKDIR /app
 
-COPY --from=builder --chown=1000:1000 /app/node_modules ./node_modules
-COPY --chown=1000:1000 package.json app.js ./
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/package.json ./package.json
+COPY app.js ./
 
 USER 1000:1000
 
 EXPOSE 8080
 
-CMD ["app.js"]
+CMD ["node", "app.js"]
