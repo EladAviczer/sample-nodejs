@@ -1,0 +1,108 @@
+name: Sample Node.js CI/CD
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Application Tests and Dependency Audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run application tests
+        run: npm test
+
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+  sast:
+    name: SAST Security Scan
+    runs-on: ubuntu-latest
+
+    container:
+      image: semgrep/semgrep:latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run Semgrep SAST
+        run: |
+          semgrep scan \
+            --config p/javascript \
+            --config p/owasp-top-ten \
+            --error \
+            app.js test/
+  image-security:
+    name: Docker Build and Trivy Scan
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    needs:
+      - test
+      - sast
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          tags: sample-nodejs:ci
+
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: sample-nodejs:ci
+          format: table
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+      
+      - name: Login to GitHub Container Registry
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag and publish scanned image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          TAG="sha-${GITHUB_SHA::12}"
+
+          docker tag sample-nodejs:ci "$IMAGE:$TAG"
+          docker push "$IMAGE:$TAG"
+
+          echo "Published: $IMAGE:$TAG"
